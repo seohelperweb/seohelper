@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { getDb } from "@seo/db";
 import { handleApi } from "@/server/api/handle.ts";
+import { readJson } from "@/server/api/read-json.ts";
 import { requireActor } from "@/server/auth/actor.ts";
 import { getSchedule, updateSchedule } from "@/server/schedule/schedule-service.ts";
 
@@ -31,7 +32,7 @@ export async function PUT(
   const { workspaceId, projectId } = await params;
   return handleApi(request, async (requestId) => {
     const actor = await requireActor(request, workspaceId);
-    const input = putBody.parse(await request.json());
+    const input = putBody.parse(await readJson(request));
     return updateSchedule(getDb(), actor, projectId, input, requestId);
   });
 }

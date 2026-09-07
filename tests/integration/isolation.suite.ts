@@ -4,7 +4,7 @@ import { before } from "node:test";
 import { actor, cleanDatabase, createWorkspaceWithOwner, createUser, db, uniqueId } from "./helpers.ts";
 import { loadActor } from "../../server/auth/actor.ts";
 import { ApiError } from "../../server/api/errors.ts";
-import { createProject, getProject, listProjects } from "../../server/services/project-service.ts";
+import { createProject, getProject, listProjects, updateProject } from "../../server/services/project-service.ts";
 import { cancelCrawl, getCrawl } from "../../server/services/crawl-service.ts";
 import { createRun } from "../../server/repositories/crawls.ts";
 import { listMembers } from "../../server/services/member-service.ts";
@@ -133,4 +133,84 @@ test("idempotency replays identical requests and rejects hash mismatches", async
     assert.equal(error.status, 409);
     return true;
   });
+});
+
+test("concurrent idempotent requests execute once and expired keys can be reused", async () => {
+  const client = db();
+  const alice = await createUser(client);
+  const workspaceId = await createWorkspaceWithOwner(client, alice);
+  const input = {
+    actorId: alice.id,
+    workspaceId,
+    route: "POST /example",
+    key: uniqueId(),
+    requestHash: "a",
+    ttlMs: 60_000,
+  };
+  let executions = 0;
+  const run = async () => `resource-${++executions}`;
+  const results = await Promise.all([withIdempotency(client, input, run), withIdempotency(client, input, run)]);
+  assert.equal(executions, 1);
+  assert.equal(results[0].resourceId, results[1].resourceId);
+  assert.equal(results.filter((result) => result.replay).length, 1);
+  await client.idempotencyRecord.updateMany({ where: { workspaceId }, data: { expiresAt: new Date(0) } });
+  const reused = await withIdempotency(client, { ...input, requestHash: "b" }, run);
+  assert.equal(reused.replay, false);
+  assert.equal(executions, 2);
+});
+
+test("failure to record idempotency rolls back the business mutation", async () => {
+  const client = db();
+  const alice = await createUser(client);
+  const workspaceId = await createWorkspaceWithOwner(client, alice, "Before");
+  await assert.rejects(
+    withIdempotency(
+      client,
+      {
+        actorId: alice.id,
+        workspaceId,
+        route: "POST /example",
+        key: uniqueId(),
+        requestHash: "a",
+        ttlMs: NaN,
+      },
+      async (tx) => {
+        await tx.workspace.update({ where: { id: workspaceId }, data: { name: "After" } });
+        return workspaceId;
+      },
+    ),
+  );
+  assert.equal((await client.workspace.findUniqueOrThrow({ where: { id: workspaceId } })).name, "Before");
+  assert.equal(await client.idempotencyRecord.count({ where: { workspaceId } }), 0);
+});
+
+test("project patches apply name and archive together and reject archiving an active crawl", async () => {
+  const client = db();
+  const owner = await createUser(client);
+  const workspaceId = await createWorkspaceWithOwner(client, owner);
+  const ownerActor = actor(owner.id, workspaceId, "OWNER");
+  const project = await createProject(client, ownerActor, { hostname: `patch-${uniqueId()}.example.com` });
+  const archived = await updateProject(client, ownerActor, project.id, { archived: true, displayName: "Renamed" });
+  assert.ok(archived.archivedAt);
+  assert.equal(archived.displayName, "Renamed");
+  await updateProject(client, ownerActor, project.id, { archived: false });
+  assert.ok(project.currentPolicyId);
+  await createRun(client, {
+    projectId: project.id,
+    policyId: project.currentPolicyId,
+    trigger: "MANUAL",
+    baseRunId: null,
+    pagesKnown: 0,
+  });
+  await assert.rejects(
+    updateProject(client, ownerActor, project.id, { archived: true, displayName: "Lost" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.code, "CRAWL_ALREADY_ACTIVE");
+      return true;
+    },
+  );
+  const current = await getProject(client, ownerActor, project.id);
+  assert.equal(current.archivedAt, null);
+  assert.equal(current.displayName, "Renamed");
 });

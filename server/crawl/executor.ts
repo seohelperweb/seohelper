@@ -19,6 +19,7 @@ import {
   renewLease,
   resetStaleFrontier,
   saveObservation,
+  urlKeyOf,
   withRunFence,
 } from "../repositories/crawls.ts";
 import type { UpsertObservationInput } from "../repositories/crawls.ts";
@@ -49,6 +50,8 @@ const MAX_PAGE_RETRIES = 2;
 const RETRY_BACKOFF_MS = 5_000;
 const ROBOTS_RETRY_DELAY_MS = 2_000;
 
+class CrawlStopped extends Error {}
+
 interface PolicyConfig {
   maxPages: number;
   maxFrontierUrls: number;
@@ -59,11 +62,13 @@ interface PolicyConfig {
 
 interface RunContext {
   runId: string;
+  leaseToken: number;
   projectId: string;
   hostname: string;
   origin: string;
   identityVersion: number;
   policy: PolicyConfig;
+  frontierTruncated: boolean;
 }
 
 interface CrawlFlags {
@@ -77,7 +82,7 @@ interface CrawlFlags {
 export async function executeCrawl(db: PrismaClient, runId: string, deps: CrawlDependencies): Promise<ExecutorOutcome> {
   const run = await db.crawlRun.findUnique({
     where: { id: runId },
-    include: { project: { include: { currentPolicy: true } } },
+    include: { project: true },
   });
   if (!run) return { status: "FAILED", completeness: "NONE", failureCode: "RUN_NOT_FOUND", pages: 0 };
   if (run.status === "COMPLETED" || run.status === "CANCELLED" || run.status === "FAILED") {
@@ -89,15 +94,23 @@ export async function executeCrawl(db: PrismaClient, runId: string, deps: CrawlD
     // Another live worker holds the lease; the Outbox event retries later.
     throw new Error("lease unavailable: another worker holds this run");
   }
-  await resetStaleFrontier(db, runId, deps.now());
+  if (run.status === "FINALIZING" && !run.cancelRequestedAt) {
+    const published = await publishRun(db, { runId, projectId: run.projectId, leaseToken }, deps.now());
+    if (published.published)
+      return { status: "COMPLETED", completeness: "FULL", failureCode: null, pages: run.pagesDone };
+  }
+  await resetStaleFrontier(db, runId, deps.now(), leaseToken);
 
-  const config = (run.project.currentPolicy?.config ?? {}) as Record<string, unknown>;
+  const policy = await db.projectPolicy.findUniqueOrThrow({ where: { id: run.policyId } });
+  const config = policy.config as Record<string, unknown>;
   const ctx: RunContext = {
     runId,
+    leaseToken,
     projectId: run.projectId,
     hostname: run.project.hostname,
     origin: `https://${run.project.hostname}`,
-    identityVersion: run.project.currentPolicy?.identityVersion ?? 1,
+    identityVersion: policy.identityVersion,
+    frontierTruncated: false,
     policy: {
       maxPages: numberFromPolicy(config, "maxPages", 5000),
       maxFrontierUrls: numberFromPolicy(config, "maxFrontierUrls", 20000),
@@ -114,215 +127,273 @@ export async function executeCrawl(db: PrismaClient, runId: string, deps: CrawlD
     bodyBudgetExceeded: false,
     cancelled: false,
   };
-  const state = { bytes: 0, pages: 0, nextRequestAt: 0 };
+  const state = { bytes: run.bytesDownloaded, pages: await countObservations(db, runId), nextRequestAt: 0 };
+  const startedAt = deps.now().getTime();
+  const deadline = ctx.policy.crawlMaxDurationMinutes * 60_000;
+  const recoveredErrors = await db.pageObservation.findMany({ where: { runId }, select: { fetchOutcome: true } });
+  flags.securityBlocked = recoveredErrors.some((row) => row.fetchOutcome === "SECURITY_BLOCKED");
+  flags.unrecovered = recoveredErrors.some((row) =>
+    ["NETWORK_ERROR", "TIMEOUT", "BODY_TOO_LARGE", "REDIRECT_LIMIT"].includes(row.fetchOutcome),
+  );
+  if (run.cancelRequestedAt) {
+    flags.cancelled = true;
+    return finalize(db, ctx, deps, leaseToken, flags, state, null);
+  }
+
+  // Persist consumed bytes before another request can crash or the worker can lose its lease.
+  const originalFetcher = deps.fetcher;
+  deps = {
+    ...deps,
+    fetcher: async (url) => {
+      const lease = await db.crawlRun.findUniqueOrThrow({
+        where: { id: runId },
+        select: { leaseToken: true, cancelRequestedAt: true },
+      });
+      if (lease.leaseToken !== leaseToken) throw new Error("lost lease before request");
+      if (lease.cancelRequestedAt) {
+        flags.cancelled = true;
+        throw new CrawlStopped("crawl cancellation requested");
+      }
+      if (state.bytes >= ctx.policy.totalBodyBudgetBytes) {
+        flags.bodyBudgetExceeded = true;
+        throw new CrawlStopped("crawl body budget exhausted");
+      }
+      if (deps.now().getTime() - startedAt >= deadline) {
+        flags.limitReached = true;
+        throw new CrawlStopped("crawl duration exhausted");
+      }
+      const result = await originalFetcher(url);
+      const saved = await withRunFence(db, runId, leaseToken, async (tx) => {
+        await tx.crawlRun.update({
+          where: { id: runId },
+          data: { bytesDownloaded: { increment: result.body?.byteLength ?? 0 } },
+        });
+        return true;
+      });
+      if (!saved) throw new Error("lost lease after request");
+      return result;
+    },
+  };
 
   // ---- robots.txt policy (conservative matrix, docs §7.3) ----
   // HTTPS is tried first; only a network-level failure falls back to HTTP:80
   // (same hostname) for sites without TLS. Authoritative answers (401/403)
   // deny without fallback.
-  const robots = await acquireRobotsPolicy(db, ctx, deps, leaseToken, state);
-  if (robots.kind === "DENIED") {
-    return finalize(db, ctx, deps, leaseToken, flags, state, { status: "FAILED", failureCode: "ROBOTS_DENIED" });
-  }
-  if (robots.kind === "UNAVAILABLE") {
-    return finalize(db, ctx, deps, leaseToken, flags, state, { status: "FAILED", failureCode: "ROBOTS_UNAVAILABLE" });
-  }
-  const rules = robots.rules;
-  ctx.origin = robots.origin;
-
-  // ---- seeds ----
-  const frontierCount = async () => countFrontier(db, runId);
-  await addCapped(db, ctx, { runId, identityUrl: normalizeUrl(ctx.origin), depth: 0, source: "SEED" }, frontierCount);
-  for (const page of await db.page.findMany({ where: { projectId: ctx.projectId }, select: { identityUrl: true } })) {
-    await addCapped(db, ctx, { runId, identityUrl: page.identityUrl, depth: 0, source: "MONITORED" }, frontierCount);
-  }
-
-  // ---- sitemap seeds ----
-  const sitemapSources = [...new Set([...(rules?.sitemaps ?? []), `${ctx.origin}/sitemap.xml`])];
-  const candidates = await collectSitemapSeeds(db, ctx, deps, leaseToken, state, sitemapSources, flags);
-  for (const candidate of candidates) {
-    await addCapped(db, ctx, { runId, identityUrl: candidate, depth: 0, source: "SITEMAP" }, frontierCount);
-  }
-
-  // ---- frontier loop ----
-  const deadline = ctx.policy.crawlMaxDurationMinutes * 60_000;
-  const startedAt = deps.now().getTime();
-
-  for (;;) {
-    if (state.pages >= ctx.policy.maxPages) {
-      flags.limitReached = true;
-      break;
+  try {
+    const robots = await acquireRobotsPolicy(db, ctx, deps, leaseToken, state);
+    if (robots.kind === "DENIED") {
+      return finalize(db, ctx, deps, leaseToken, flags, state, { status: "FAILED", failureCode: "ROBOTS_DENIED" });
     }
-    if (state.bytes >= ctx.policy.totalBodyBudgetBytes) {
-      flags.bodyBudgetExceeded = true;
-      break;
+    if (robots.kind === "UNAVAILABLE") {
+      return finalize(db, ctx, deps, leaseToken, flags, state, { status: "FAILED", failureCode: "ROBOTS_UNAVAILABLE" });
     }
-    if (deps.now().getTime() - startedAt >= deadline) {
-      flags.limitReached = true;
-      break;
+    const rules = robots.rules;
+    ctx.origin = robots.origin;
+
+    // ---- seeds ----
+    const frontierCount = async () => countFrontier(db, runId);
+    await addCapped(db, ctx, { runId, identityUrl: normalizeUrl(ctx.origin), depth: 0, source: "SEED" }, frontierCount);
+    for (const page of await db.page.findMany({ where: { projectId: ctx.projectId }, select: { identityUrl: true } })) {
+      await addCapped(db, ctx, { runId, identityUrl: page.identityUrl, depth: 0, source: "MONITORED" }, frontierCount);
     }
 
-    const lease = await db.crawlRun.findUnique({
-      where: { id: runId },
-      select: { status: true, cancelRequestedAt: true, leaseToken: true },
-    });
-    if (!lease || lease.leaseToken !== leaseToken) {
-      return { status: "CANCELLED", completeness: "NONE", failureCode: "FENCED_OUT", pages: state.pages };
+    // ---- sitemap seeds ----
+    const sitemapSources = [...new Set([...(rules?.sitemaps ?? []), `${ctx.origin}/sitemap.xml`])];
+    const candidates = await collectSitemapSeeds(db, ctx, deps, leaseToken, state, sitemapSources, flags);
+    for (const candidate of candidates) {
+      await addCapped(db, ctx, { runId, identityUrl: candidate, depth: 0, source: "SITEMAP" }, frontierCount);
     }
-    if (lease.status === "CANCELLED") {
-      flags.cancelled = true;
-      break;
-    }
-    if (lease.cancelRequestedAt) {
-      flags.cancelled = true;
-      break;
-    }
-    await renewLease(db, runId, leaseToken, LEASE_MS, deps.now());
 
-    const item = await claimNextFrontierItem(db, runId, deps.now());
-    if (!item) {
-      // Frontier has no due item: wait for the earliest retry instead of quitting.
-      const waiting = await db.crawlFrontier.findFirst({
-        where: { runId, state: "PENDING" },
-        orderBy: [{ nextAttemptAt: "asc" }],
-      });
-      if (waiting && waiting.nextAttemptAt.getTime() <= startedAt + deadline) {
-        await deps.sleep(Math.max(0, waiting.nextAttemptAt.getTime() - deps.now().getTime()));
-        continue;
+    // ---- frontier loop ----
+    for (;;) {
+      if ((await db.crawlFrontier.count({ where: { runId, state: { in: ["PENDING", "FETCHING"] } } })) === 0) break;
+      if (state.pages >= ctx.policy.maxPages) {
+        flags.limitReached = true;
+        break;
       }
-      break;
-    }
+      if (state.bytes >= ctx.policy.totalBodyBudgetBytes) {
+        flags.bodyBudgetExceeded = true;
+        break;
+      }
+      if (deps.now().getTime() - startedAt >= deadline) {
+        flags.limitReached = true;
+        break;
+      }
 
-    // Rate pacing: hostname-global budget (single-hostname projects).
-    const waitMs = state.nextRequestAt - deps.now().getTime();
-    if (waitMs > 0) await deps.sleep(waitMs);
-    state.nextRequestAt = deps.now().getTime() + 1000 / ctx.policy.hostRateRequestsPerSecond;
-
-    let target: URL;
-    try {
-      target = new URL(item.requestUrl);
-    } catch {
-      await markFrontierDone(db, item.id);
-      continue;
-    }
-    if (rules && !isAllowedByRobots(rules, "IndexlyBot", target)) {
-      await saveObservation(db, {
-        runId,
-        projectId: ctx.projectId,
-        identityVersion: ctx.identityVersion,
-        identityUrl: item.requestUrl,
-        fetchOutcome: "ROBOTS_BLOCKED",
-        requestUrl: item.requestUrl,
-        failureCode: "ROBOTS_DISALLOWED",
-        fieldValidity: unknownHtmlFields(),
-        fetchedAt: deps.now(),
+      const lease = await db.crawlRun.findUnique({
+        where: { id: runId },
+        select: { status: true, cancelRequestedAt: true, leaseToken: true },
       });
-      await markFrontierDone(db, item.id);
-      state.pages += 1;
-      continue;
-    }
+      if (!lease || lease.leaseToken !== leaseToken) {
+        return { status: "CANCELLED", completeness: "NONE", failureCode: "FENCED_OUT", pages: state.pages };
+      }
+      if (lease.status === "CANCELLED") {
+        flags.cancelled = true;
+        break;
+      }
+      if (lease.cancelRequestedAt) {
+        flags.cancelled = true;
+        break;
+      }
+      if (!(await renewLease(db, runId, leaseToken, LEASE_MS, deps.now()))) throw new Error("lost crawl lease");
 
-    const result = await deps.fetcher(item.requestUrl);
-    if (result.body) state.bytes += result.body.byteLength;
-
-    if (result.outcome === "NETWORK_ERROR" || result.outcome === "TIMEOUT") {
-      const attempts = item.attempts + 1;
-      if (attempts <= MAX_PAGE_RETRIES) {
-        await db.crawlFrontier.update({
-          where: { id: item.id },
-          data: {
-            state: "PENDING",
-            attempts,
-            nextAttemptAt: new Date(deps.now().getTime() + RETRY_BACKOFF_MS * attempts),
-          },
+      const item = await claimNextFrontierItem(db, runId, deps.now(), leaseToken);
+      if (!item) {
+        // Frontier has no due item: wait for the earliest retry instead of quitting.
+        const waiting = await db.crawlFrontier.findFirst({
+          where: { runId, state: "PENDING" },
+          orderBy: [{ nextAttemptAt: "asc" }],
         });
+        if (waiting && waiting.nextAttemptAt.getTime() <= startedAt + deadline) {
+          await deps.sleep(Math.max(0, waiting.nextAttemptAt.getTime() - deps.now().getTime()));
+          continue;
+        }
+        if (waiting) flags.limitReached = true;
+        break;
+      }
+
+      // Rate pacing: hostname-global budget (single-hostname projects).
+      const waitMs = state.nextRequestAt - deps.now().getTime();
+      if (waitMs > 0) await deps.sleep(waitMs);
+      state.nextRequestAt = deps.now().getTime() + 1000 / ctx.policy.hostRateRequestsPerSecond;
+
+      let target: URL;
+      try {
+        target = new URL(item.requestUrl);
+      } catch {
+        await markFrontierDone(db, ctx, item.id);
         continue;
       }
-      flags.unrecovered = true;
-      await saveObservation(
-        db,
-        baseObservation(ctx, item.requestUrl, result, deps.now(), { failureCode: result.outcome }),
-      );
-      await markFrontierDone(db, item.id);
-      state.pages += 1;
-      continue;
-    }
+      if (rules && !isAllowedByRobots(rules, "IndexlyBot", target)) {
+        await saveObservation(db, {
+          runId,
+          leaseToken,
+          projectId: ctx.projectId,
+          identityVersion: ctx.identityVersion,
+          identityUrl: item.requestUrl,
+          fetchOutcome: "ROBOTS_BLOCKED",
+          requestUrl: item.requestUrl,
+          failureCode: "ROBOTS_DISALLOWED",
+          fieldValidity: unknownHtmlFields(),
+          fetchedAt: deps.now(),
+        });
+        await markFrontierDone(db, ctx, item.id);
+        state.pages = await countObservations(db, runId);
+        continue;
+      }
 
-    if (result.outcome === "SECURITY_BLOCKED") flags.securityBlocked = true;
-    if (result.outcome === "BODY_TOO_LARGE") flags.unrecovered = true;
+      const result = await deps.fetcher(item.requestUrl);
+      if (result.body) state.bytes += result.body.byteLength;
 
-    if (result.outcome === "HTTP_RESPONSE") {
-      // Redirect sources never inherit the target's content (docs §6): only
-      // direct 2xx HTML responses participate in extraction and discovery.
-      const html =
-        isHtmlContentType(result.contentType) &&
-        (result.finalStatus ?? 0) >= 200 &&
-        (result.finalStatus ?? 0) < 300 &&
-        result.redirectChain.length === 0 &&
-        result.body !== null;
-      const text = html && result.body ? new TextDecoder("utf-8", { fatal: false }).decode(result.body) : "";
-      const extracted = html ? extractPage(text, result.finalUrl ?? item.requestUrl) : null;
+      if (result.outcome === "NETWORK_ERROR" || result.outcome === "TIMEOUT") {
+        const attempts = item.attempts + 1;
+        if (attempts <= MAX_PAGE_RETRIES) {
+          await withRunFence(db, runId, leaseToken, async (tx) =>
+            tx.crawlFrontier.update({
+              where: { id: item.id },
+              data: {
+                state: "PENDING",
+                attempts,
+                nextAttemptAt: new Date(deps.now().getTime() + RETRY_BACKOFF_MS * attempts),
+              },
+            }),
+          );
+          continue;
+        }
+        flags.unrecovered = true;
+        await saveObservation(
+          db,
+          baseObservation(ctx, item.requestUrl, result, deps.now(), { failureCode: result.outcome }),
+        );
+        await markFrontierDone(db, ctx, item.id);
+        state.pages = await countObservations(db, runId);
+        continue;
+      }
 
-      const observation: UpsertObservationInput = baseObservation(ctx, item.requestUrl, result, deps.now(), {});
-      if (extracted !== null) {
-        const robotsSources = [...extracted.robotsRaw];
-        if (result.xRobotsTag) robotsSources.push(result.xRobotsTag);
-        observation.title = extracted.title;
-        observation.metaDescription = extracted.metaDescription;
-        observation.canonical = {
-          raw: extracted.canonicalRaw,
-          resolved: extracted.canonicalResolved,
-          validity: "KNOWN",
-        };
-        // A fetched HTML page with no robots directives is decisively allowed
-        // (Googlebot semantics); UNKNOWN is reserved for unobservable pages.
-        observation.robots = {
-          raw: robotsSources,
-          index: robotsSources.length === 0 ? "ALLOWED" : synthesizeIndexState(robotsSources),
-        };
-        observation.internalLinksCount = extracted.internalLinks.length;
-        observation.fieldValidity = {
-          title: "KNOWN",
-          metaDescription: "KNOWN",
-          canonical: "KNOWN",
-          robots: "KNOWN",
-          internalLinksCount: "KNOWN",
-        };
+      if (result.outcome === "SECURITY_BLOCKED") flags.securityBlocked = true;
+      if (result.outcome === "BODY_TOO_LARGE" || result.outcome === "REDIRECT_LIMIT") flags.unrecovered = true;
 
-        // Link discovery within scope and frontier budget.
-        for (const link of extracted.internalLinks) {
-          await addCapped(db, ctx, { runId, identityUrl: link, depth: item.depth + 1, source: "LINK" }, frontierCount);
+      if (result.outcome === "HTTP_RESPONSE") {
+        // Redirect sources never inherit the target's content (docs §6): only
+        // direct 2xx HTML responses participate in extraction and discovery.
+        const html =
+          isHtmlContentType(result.contentType) &&
+          (result.finalStatus ?? 0) >= 200 &&
+          (result.finalStatus ?? 0) < 300 &&
+          result.redirectChain.length === 0 &&
+          result.body !== null;
+        const text = html && result.body ? new TextDecoder("utf-8", { fatal: false }).decode(result.body) : "";
+        const extracted = html ? extractPage(text, result.finalUrl ?? item.requestUrl) : null;
+
+        const observation: UpsertObservationInput = baseObservation(ctx, item.requestUrl, result, deps.now(), {});
+        if (extracted !== null) {
+          const robotsSources = [...extracted.robotsRaw];
+          if (result.xRobotsTag) robotsSources.push(result.xRobotsTag);
+          observation.title = extracted.title;
+          observation.metaDescription = extracted.metaDescription;
+          observation.canonical = {
+            raw: extracted.canonicalRaw,
+            resolved: extracted.canonicalResolved,
+            validity: "KNOWN",
+          };
+          // A fetched HTML page with no robots directives is decisively allowed
+          // (Googlebot semantics); UNKNOWN is reserved for unobservable pages.
+          observation.robots = {
+            raw: robotsSources,
+            index: robotsSources.length === 0 ? "ALLOWED" : synthesizeIndexState(robotsSources),
+          };
+          observation.internalLinksCount = extracted.internalLinks.length;
+          observation.fieldValidity = {
+            title: "KNOWN",
+            metaDescription: "KNOWN",
+            canonical: "KNOWN",
+            robots: "KNOWN",
+            internalLinksCount: "KNOWN",
+          };
+
+          // Link discovery within scope and frontier budget.
+          for (const link of extracted.internalLinks) {
+            await addCapped(
+              db,
+              ctx,
+              { runId, identityUrl: link, depth: item.depth + 1, source: "LINK" },
+              frontierCount,
+            );
+          }
+        } else {
+          observation.fieldValidity = notApplicableHtmlFields();
+        }
+        await saveObservation(db, observation);
+
+        // Redirect chains end at an in-scope identity that deserves its own observation (docs §6).
+        if (result.redirectChain.length > 0 && result.finalUrl) {
+          try {
+            await addCapped(
+              db,
+              ctx,
+              { runId, identityUrl: normalizeUrl(result.finalUrl), depth: item.depth, source: "REDIRECT" },
+              frontierCount,
+            );
+          } catch {
+            /* invalid final URL: chain is already recorded */
+          }
         }
       } else {
-        observation.fieldValidity = notApplicableHtmlFields();
+        await saveObservation(
+          db,
+          baseObservation(ctx, item.requestUrl, result, deps.now(), { failureCode: result.outcome }),
+        );
       }
-      await saveObservation(db, observation);
 
-      // Redirect chains end at an in-scope identity that deserves its own observation (docs §6).
-      if (result.redirectChain.length > 0 && result.finalUrl) {
-        try {
-          await addCapped(
-            db,
-            ctx,
-            { runId, identityUrl: normalizeUrl(result.finalUrl), depth: item.depth, source: "REDIRECT" },
-            frontierCount,
-          );
-        } catch {
-          /* invalid final URL: chain is already recorded */
-        }
-      }
-    } else {
-      await saveObservation(
-        db,
-        baseObservation(ctx, item.requestUrl, result, deps.now(), { failureCode: result.outcome }),
-      );
+      await markFrontierDone(db, ctx, item.id);
+      state.pages = await countObservations(db, runId);
     }
 
-    await markFrontierDone(db, item.id);
-    state.pages += 1;
+    return finalize(db, ctx, deps, leaseToken, flags, state, null);
+  } catch (error) {
+    if (!(error instanceof CrawlStopped)) throw error;
+    return finalize(db, ctx, deps, leaseToken, flags, state, null);
   }
-
-  return finalize(db, ctx, deps, leaseToken, flags, state, null);
 }
 
 async function addCapped(
@@ -336,19 +407,25 @@ async function addCapped(
   },
   frontierCount: () => Promise<number>,
 ): Promise<boolean> {
-  try {
-    new URL(input.identityUrl);
-  } catch {
-    return false;
-  }
+  const identity = sameHostIdentity(input.identityUrl, ctx.hostname);
+  if (!identity) return false;
+  input = { ...input, identityUrl: identity };
   if (input.identityUrl.length > 8192) return false;
   const current = await frontierCount();
-  if (current >= ctx.policy.maxFrontierUrls) return false;
-  return addFrontierUrl(db, input);
+  if (current >= ctx.policy.maxFrontierUrls) {
+    const existing = await db.crawlFrontier.findUnique({
+      where: { runId_urlKey: { runId: ctx.runId, urlKey: urlKeyOf(identity) } },
+    });
+    if (!existing) ctx.frontierTruncated = true;
+    return false;
+  }
+  return (await withRunFence(db, ctx.runId, ctx.leaseToken, (tx) => addFrontierUrl(tx, input))) ?? false;
 }
 
-async function markFrontierDone(db: PrismaClient, frontierId: string): Promise<void> {
-  await db.crawlFrontier.update({ where: { id: frontierId }, data: { state: "DONE" } });
+async function markFrontierDone(db: PrismaClient, ctx: RunContext, frontierId: string): Promise<void> {
+  await withRunFence(db, ctx.runId, ctx.leaseToken, async (tx) =>
+    tx.crawlFrontier.update({ where: { id: frontierId }, data: { state: "DONE" } }),
+  );
 }
 
 function baseObservation(
@@ -361,6 +438,7 @@ function baseObservation(
   const htmlOutcome = result.outcome === "HTTP_RESPONSE";
   return {
     runId: ctx.runId,
+    leaseToken: ctx.leaseToken,
     projectId: ctx.projectId,
     identityVersion: ctx.identityVersion,
     identityUrl: requestUrl,
@@ -415,6 +493,7 @@ async function acquireRobotsPolicy(
   // HTTPS attempt failed at the network level — a site answering over TLS
   // never gets re-asked over plain HTTP.
   const attemptOrigin = async (origin: string, allowRetry: boolean): Promise<RobotsPolicy | null> => {
+    let fallbackAllowed = true;
     for (let attempt = 1; attempt <= (allowRetry ? 3 : 1); attempt += 1) {
       if (!(await renewLease(db, ctx.runId, leaseToken, LEASE_MS, deps.now()))) {
         throw new Error("lost lease during robots acquisition");
@@ -429,7 +508,11 @@ async function acquireRobotsPolicy(
       if (result.outcome === "HTTP_RESPONSE") {
         const status = result.finalStatus ?? 0;
         if (status === 200 && result.body) {
-          return { kind: "OK", rules: parseRobots(new TextDecoder().decode(result.body)), origin };
+          return {
+            kind: "OK",
+            rules: parseRobots(new TextDecoder().decode(result.body)),
+            origin: new URL(result.finalUrl ?? origin).origin,
+          };
         }
         // A 404/410 over HTTPS is ambiguous on http-only sites (the TLS
         // listener may answer before the real HTTP server), so it triggers
@@ -438,11 +521,14 @@ async function acquireRobotsPolicy(
           return { kind: "OK", rules: null, origin }; // no robots → unrestricted
         }
         if (status === 401 || status === 403) return { kind: "DENIED", origin }; // conservative refusal, no fallback
-        // 429/5xx fall through to retry.
+        if (status !== 404 && status !== 410) fallbackAllowed = false;
+        if (status !== 429 && status < 500 && status !== 404 && status !== 410) return { kind: "UNAVAILABLE", origin };
+      } else if (result.outcome !== "NETWORK_ERROR" && result.outcome !== "TIMEOUT") {
+        return { kind: "UNAVAILABLE", origin };
       }
       if (attempt < (allowRetry ? 3 : 1)) await deps.sleep(ROBOTS_RETRY_DELAY_MS);
     }
-    return null; // network-level failure (or retries exhausted) → caller decides
+    return fallbackAllowed ? null : { kind: "UNAVAILABLE", origin };
   };
 
   const viaHttps = await attemptOrigin(httpsOrigin, true);
@@ -463,7 +549,7 @@ async function collectSitemapSeeds(
   sources: string[],
   flags: CrawlFlags,
 ): Promise<string[]> {
-  const queue = [...sources];
+  const queue = sources.map((url) => ({ url, depth: 0 }));
   const seenDocuments = new Set<string>();
   const candidates = new Set<string>();
   const MAX_DOCS = 20;
@@ -473,8 +559,10 @@ async function collectSitemapSeeds(
     if (!(await renewLease(db, ctx.runId, leaseToken, LEASE_MS, deps.now()))) {
       throw new Error("lost lease during sitemap discovery");
     }
-    const url = queue.shift();
-    if (!url || seenDocuments.has(url)) continue;
+    const next = queue.shift();
+    if (!next) continue;
+    const { url, depth } = next;
+    if (seenDocuments.has(url) || !sameHostIdentity(url, ctx.hostname)) continue;
     seenDocuments.add(url);
 
     const waitMs = state.nextRequestAt - deps.now().getTime();
@@ -497,7 +585,14 @@ async function collectSitemapSeeds(
       }
     } else if (parsed.kind === "INDEX") {
       for (const child of parsed.sitemapUrls) {
-        if (seenDocuments.size + queue.length < MAX_DOCS) queue.push(child);
+        if (
+          seenDocuments.has(child) ||
+          queue.some((entry) => entry.url === child) ||
+          !sameHostIdentity(child, ctx.hostname)
+        )
+          continue;
+        if (depth < 3 && seenDocuments.size + queue.length < MAX_DOCS) queue.push({ url: child, depth: depth + 1 });
+        else flags.limitReached = true;
       }
     }
   }
@@ -526,11 +621,19 @@ async function finalize(
   forced: { status: "FAILED"; failureCode: string } | null,
 ): Promise<ExecutorOutcome> {
   const observations = await countObservations(db, ctx.runId);
+  state.pages = observations;
+  flags.limitReached ||= ctx.frontierTruncated;
+  if (state.bytes > ctx.policy.totalBodyBudgetBytes) flags.bodyBudgetExceeded = true;
+  const httpObservations = await db.pageObservation.count({
+    where: { runId: ctx.runId, fetchOutcome: "HTTP_RESPONSE" },
+  });
+  const pending = await db.crawlFrontier.count({ where: { runId: ctx.runId, state: { in: ["PENDING", "FETCHING"] } } });
+  if (pending > 0) flags.limitReached = true;
 
   const isFullCandidate =
     forced === null &&
     !flags.cancelled &&
-    observations > 0 &&
+    httpObservations > 0 &&
     !flags.securityBlocked &&
     !flags.bodyBudgetExceeded &&
     !flags.unrecovered &&
@@ -541,17 +644,34 @@ async function finalize(
   // two steps re-enters via the Outbox retry and publishes idempotently.
   if (isFullCandidate) {
     const marked = await withRunFence(db, ctx.runId, leaseToken, async (tx) => {
+      const run = await tx.crawlRun.findUniqueOrThrow({
+        where: { id: ctx.runId },
+        select: { cancelRequestedAt: true },
+      });
+      if (run.cancelRequestedAt) {
+        flags.cancelled = true;
+        return false;
+      }
       await tx.crawlRun.update({
         where: { id: ctx.runId },
         data: { status: "FINALIZING", bytesDownloaded: state.bytes, pagesDone: state.pages },
       });
       return true;
     });
+    if (marked === false) return finalize(db, ctx, deps, leaseToken, flags, state, null);
     if (marked === null) {
       return { status: "CANCELLED", completeness: "NONE", failureCode: "FENCED_OUT", pages: state.pages };
     }
     const published = await publishRun(db, { runId: ctx.runId, projectId: ctx.projectId, leaseToken }, deps.now());
     if (!published.published) {
+      const run = await db.crawlRun.findUniqueOrThrow({
+        where: { id: ctx.runId },
+        select: { cancelRequestedAt: true },
+      });
+      if (run.cancelRequestedAt) {
+        flags.cancelled = true;
+        return finalize(db, ctx, deps, leaseToken, flags, state, null);
+      }
       return { status: "CANCELLED", completeness: "NONE", failureCode: "FENCED_OUT", pages: state.pages };
     }
     return { status: "COMPLETED", completeness: "FULL", failureCode: null, pages: state.pages };
@@ -569,7 +689,7 @@ async function finalize(
     } else if (flags.cancelled) {
       status = "CANCELLED";
       completeness = "NONE";
-    } else if (observations === 0) {
+    } else if (httpObservations === 0) {
       status = "FAILED";
       completeness = "NONE";
       failureCode = "NO_OBSERVATIONS";

@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { getDb } from "@seo/db";
 import { handleApi } from "@/server/api/handle.ts";
+import { readJson } from "@/server/api/read-json.ts";
 import { getSessionUser } from "@/server/auth/actor.ts";
 import { createWorkspace, listWorkspacesForUser } from "@/server/services/workspace-service.ts";
 
@@ -20,7 +21,7 @@ const createBody = z.object({ name: z.string().trim().min(1).max(100) });
 export async function POST(request: NextRequest) {
   return handleApi(request, async (requestId) => {
     const session = await getSessionUser(request);
-    const input = createBody.parse(await request.json());
+    const input = createBody.parse(await readJson(request));
     const workspace = await createWorkspace(getDb(), { userId: session.id }, input, requestId);
     return { id: workspace.id, name: workspace.name, role: "OWNER", createdAt: workspace.createdAt };
   });

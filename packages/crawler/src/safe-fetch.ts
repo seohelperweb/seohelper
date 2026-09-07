@@ -184,7 +184,12 @@ export async function safeFetch(rawUrl: string, options: SafeFetchOptions): Prom
         timeoutMs: limits.requestTimeoutMs,
       });
     } catch (error) {
-      const outcome = error instanceof Error && error.name === "TimeoutError" ? "TIMEOUT" : "NETWORK_ERROR";
+      const outcome =
+        error instanceof SafeFetchError
+          ? error.outcome
+          : error instanceof Error && error.name === "TimeoutError"
+            ? "TIMEOUT"
+            : "NETWORK_ERROR";
       return { ...result, outcome, error: error instanceof Error ? error.message : "transport failure" };
     }
 

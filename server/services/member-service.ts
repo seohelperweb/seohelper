@@ -25,51 +25,61 @@ export interface InviteResult {
 
 /** Create a one-time invitation. The raw token is returned exactly once; only its hash is stored. */
 export async function inviteMember(
-  db: DbClient,
+  db: PrismaClient,
   actor: ActorContext,
   input: { email: string; role: WorkspaceRole },
   requestId?: string,
 ): Promise<InviteResult> {
-  if (!can(actor.role, "manage-members")) throw ApiError.forbidden();
-  if (input.role === "OWNER" && !can(actor.role, "manage-owners")) {
-    throw ApiError.forbidden("Only owners can grant the owner role");
-  }
-  const email = input.email.trim().toLowerCase();
-  const token = createInvitationToken();
-  const expiresAt = invitationExpiry();
-  const invitation = await invitations.create(db, {
-    workspaceId: actor.workspaceId,
-    email,
-    role: input.role,
-    tokenHash: hashToken(token),
-    expiresAt,
+  return db.$transaction(async (tx) => {
+    await memberships.lockWorkspace(tx, actor.workspaceId);
+    const currentActor = await memberships.findForUser(tx, actor.workspaceId, actor.userId);
+    if (!currentActor) throw ApiError.notFound("Workspace not found");
+    if (!can(currentActor.role, "manage-members")) throw ApiError.forbidden();
+    if (input.role === "OWNER" && !can(currentActor.role, "manage-owners")) {
+      throw ApiError.forbidden("Only owners can grant the owner role");
+    }
+    const email = input.email.trim().toLowerCase();
+    const token = createInvitationToken();
+    const expiresAt = invitationExpiry();
+    const invitation = await invitations.create(tx, {
+      workspaceId: actor.workspaceId,
+      email,
+      role: input.role,
+      tokenHash: hashToken(token),
+      expiresAt,
+    });
+    await recordAudit(tx, {
+      workspaceId: actor.workspaceId,
+      actorId: actor.userId,
+      action: "member.invited",
+      resourceId: invitation.id,
+      requestId,
+      details: { email, role: input.role },
+    });
+    return { invitationId: invitation.id, token, expiresAt };
   });
-  await recordAudit(db, {
-    workspaceId: actor.workspaceId,
-    actorId: actor.userId,
-    action: "member.invited",
-    resourceId: invitation.id,
-    requestId,
-    details: { email, role: input.role },
-  });
-  return { invitationId: invitation.id, token, expiresAt };
 }
 
 export async function revokeInvitation(
-  db: DbClient,
+  db: PrismaClient,
   actor: ActorContext,
   invitationId: string,
   requestId?: string,
 ): Promise<void> {
-  if (!can(actor.role, "manage-members")) throw ApiError.forbidden();
-  const count = await invitations.revoke(db, invitationId, actor.workspaceId, new Date());
-  if (count !== 1) throw ApiError.notFound("Invitation not found");
-  await recordAudit(db, {
-    workspaceId: actor.workspaceId,
-    actorId: actor.userId,
-    action: "member.invitation_revoked",
-    resourceId: invitationId,
-    requestId,
+  await db.$transaction(async (tx) => {
+    await memberships.lockWorkspace(tx, actor.workspaceId);
+    const currentActor = await memberships.findForUser(tx, actor.workspaceId, actor.userId);
+    if (!currentActor) throw ApiError.notFound("Workspace not found");
+    if (!can(currentActor.role, "manage-members")) throw ApiError.forbidden();
+    const count = await invitations.revoke(tx, invitationId, actor.workspaceId, new Date());
+    if (count !== 1) throw ApiError.notFound("Invitation not found");
+    await recordAudit(tx, {
+      workspaceId: actor.workspaceId,
+      actorId: actor.userId,
+      action: "member.invitation_revoked",
+      resourceId: invitationId,
+      requestId,
+    });
   });
 }
 
@@ -142,12 +152,14 @@ export async function changeMemberRole(
   requestId?: string,
 ): Promise<Membership> {
   return db.$transaction(async (tx) => {
+    await memberships.lockWorkspace(tx, actor.workspaceId);
+    const currentActor = await memberships.findForUser(tx, actor.workspaceId, actor.userId);
+    if (!currentActor) throw ApiError.notFound("Workspace not found");
     const target = await memberships.findById(tx, membershipId);
     if (!target || target.workspaceId !== actor.workspaceId) throw ApiError.notFound("Member not found");
+    if (!canModifyMember(currentActor.role, target.role, newRole)) throw ApiError.forbidden();
     if (target.role === newRole) return target;
-    if (!canModifyMember(actor.role, target.role, newRole)) throw ApiError.forbidden();
     if (target.role === "OWNER" && newRole !== "OWNER") {
-      await memberships.lockWorkspace(tx, actor.workspaceId);
       const owners = await memberships.countByRole(tx, actor.workspaceId, "OWNER");
       if (owners <= 1) throw ApiError.forbidden("The last owner cannot be demoted");
     }
@@ -171,13 +183,15 @@ export async function removeMember(
   requestId?: string,
 ): Promise<void> {
   await db.$transaction(async (tx) => {
+    await memberships.lockWorkspace(tx, actor.workspaceId);
+    const currentActor = await memberships.findForUser(tx, actor.workspaceId, actor.userId);
+    if (!currentActor) throw ApiError.notFound("Workspace not found");
     const target = await memberships.findById(tx, membershipId);
     if (!target || target.workspaceId !== actor.workspaceId) throw ApiError.notFound("Member not found");
     if (target.userId === actor.userId)
       throw ApiError.forbidden("Use workspace settings to leave; self-removal is not supported yet");
-    if (!canModifyMember(actor.role, target.role)) throw ApiError.forbidden();
+    if (!canModifyMember(currentActor.role, target.role)) throw ApiError.forbidden();
     if (target.role === "OWNER") {
-      await memberships.lockWorkspace(tx, actor.workspaceId);
       const owners = await memberships.countByRole(tx, actor.workspaceId, "OWNER");
       if (owners <= 1) throw ApiError.forbidden("The last owner cannot be removed");
     }

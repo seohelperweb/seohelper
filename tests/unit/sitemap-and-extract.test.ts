@@ -44,6 +44,24 @@ test("candidate budget caps the walk", () => {
   assert.equal(truncated, true);
 });
 
+test("nested sitemap indexes enforce depth and report dropped children", () => {
+  let fetched = 0;
+  const root = { kind: "INDEX" as const, sitemapUrls: ["https://example.com/1.xml"], pageUrls: [] };
+  const depth = collectSitemapCandidates(root, () => {
+    fetched += 1;
+    return { kind: "INDEX", sitemapUrls: [`https://example.com/${fetched + 1}.xml`], pageUrls: [] };
+  });
+  assert.equal(fetched, SITEMAP_LIMITS.maxDepth);
+  assert.equal(depth.truncated, true);
+
+  const documents = collectSitemapCandidates(root, (url) => ({
+    kind: "INDEX",
+    sitemapUrls: Array.from({ length: 50 }, (_, i) => `${url}/${i}.xml`),
+    pageUrls: [],
+  }));
+  assert.equal(documents.truncated, true);
+});
+
 const page = `
 <html>
   <head>

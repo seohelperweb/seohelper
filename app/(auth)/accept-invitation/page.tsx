@@ -32,6 +32,8 @@ function AcceptForm() {
       } else {
         setError(body.error?.message ?? "接受邀请失败");
       }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "接受邀请失败，请重试");
     } finally {
       setPending(false);
     }

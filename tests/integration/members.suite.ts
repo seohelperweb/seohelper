@@ -82,4 +82,36 @@ test("member listing is visible to every role", async () => {
   assert.equal(page.items.length, 4);
 });
 
+test("unchanged role requests still enforce member-management permissions", async () => {
+  const { client, workspaceId, admin, viewer } = await setupTeam();
+  const adminId = await memberships.findId(client, workspaceId, admin.id);
+  await expectForbidden(changeMemberRole(client, actor(viewer.id, workspaceId, "VIEWER"), adminId, "ADMIN"));
+});
+
+test("a stale owner context cannot grant owner after the member was demoted", async () => {
+  const { client, workspaceId, owner, admin, viewer } = await setupTeam();
+  const ownerId = await memberships.findId(client, workspaceId, owner.id);
+  const adminId = await memberships.findId(client, workspaceId, admin.id);
+  const viewerId = await memberships.findId(client, workspaceId, viewer.id);
+  const staleActor = actor(owner.id, workspaceId, "OWNER");
+  await changeMemberRole(client, staleActor, adminId, "OWNER");
+  await changeMemberRole(client, actor(admin.id, workspaceId, "OWNER"), ownerId, "VIEWER");
+  await expectForbidden(changeMemberRole(client, staleActor, viewerId, "OWNER"));
+  await expectForbidden(removeMember(client, staleActor, viewerId));
+  await expectForbidden(inviteMember(client, staleActor, { email: `stale-${uniqueId()}@example.test`, role: "OWNER" }));
+});
+
+test("simultaneous owner demotions preserve at least one owner", async () => {
+  const { client, workspaceId, owner, admin } = await setupTeam();
+  const ownerId = await memberships.findId(client, workspaceId, owner.id);
+  const adminId = await memberships.findId(client, workspaceId, admin.id);
+  await changeMemberRole(client, actor(owner.id, workspaceId, "OWNER"), adminId, "OWNER");
+  const outcomes = await Promise.allSettled([
+    changeMemberRole(client, actor(owner.id, workspaceId, "OWNER"), ownerId, "ADMIN"),
+    changeMemberRole(client, actor(admin.id, workspaceId, "OWNER"), adminId, "ADMIN"),
+  ]);
+  assert.equal(outcomes.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(await client.membership.count({ where: { workspaceId, role: "OWNER" } }), 1);
+});
+
 export {};

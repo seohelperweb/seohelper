@@ -105,8 +105,12 @@ export function MembersPanel({
 
   const copyLink = async () => {
     if (!inviteLink) return;
-    await navigator.clipboard.writeText(inviteLink).catch(() => undefined);
-    onToast("邀请链接已复制（只显示这一次，注意保存）");
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      onToast("邀请链接已复制（只显示这一次，注意保存）");
+    } catch {
+      onToast("复制失败，请手动选择并复制邀请链接");
+    }
   };
 
   return (

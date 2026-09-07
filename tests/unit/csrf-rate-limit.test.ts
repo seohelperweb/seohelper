@@ -40,6 +40,12 @@ test("missing Origin is allowed for non-browser clients; safe methods skip check
   assert.equal(isSafeMethod("DELETE"), false);
 });
 
+test("an explicit opaque or malformed Origin cannot bypass CSRF validation", () => {
+  for (const origin of ["null", "", "not-an-origin"]) {
+    assert.throws(() => assertSameOrigin(requestWith({ origin })), ApiError);
+  }
+});
+
 test("auth rate limiter enforces sliding windows per subject and resets after expiry", () => {
   cleanupBuckets(0);
   const path = "/api/auth/sign-in/email";
@@ -64,6 +70,10 @@ test("sign-up and verification endpoints have their own limits; unknown routes p
     assert.equal(checkAuthRateLimit("/api/auth/sign-up/email", "9.9.9.9", 2_000_000 + i), true);
   }
   assert.equal(checkAuthRateLimit("/api/auth/sign-up/email", "9.9.9.9", 2_000_000 + 100), false);
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal(checkAuthRateLimit("/api/auth/send-verification-email", "9.9.9.9", 2_000_000 + i), true);
+  }
+  assert.equal(checkAuthRateLimit("/api/auth/send-verification-email", "9.9.9.9", 2_000_000 + 100), false);
 });
 
 test("client key prefers the forwarded IP header", () => {

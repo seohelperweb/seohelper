@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { getDb } from "@seo/db";
 import { handleApi } from "@/server/api/handle.ts";
+import { readJson } from "@/server/api/read-json.ts";
 import { ApiError } from "@/server/api/errors.ts";
 import { requireActor } from "@/server/auth/actor.ts";
 import { updateIssueSuppression } from "@/server/services/issue-service.ts";
@@ -20,7 +21,7 @@ export async function PATCH(
   const { workspaceId, projectId, issueId } = await params;
   return handleApi(request, async (requestId) => {
     const actor = await requireActor(request, workspaceId);
-    const raw = patchBody.parse(await request.json().catch(() => ({})));
+    const raw = patchBody.parse(await readJson(request));
     if (raw.suppressedUntil === undefined) {
       throw ApiError.badRequest("Nothing to update: pass suppressedUntil (ISO datetime or null)");
     }

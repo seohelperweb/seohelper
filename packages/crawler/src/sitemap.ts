@@ -41,37 +41,46 @@ export function collectSitemapCandidates(
   fetchIndex: (url: string) => ParsedSitemap | null,
 ): { urls: string[]; truncated: boolean } {
   const urls: string[] = [];
-  const seen = new Set<string>();
+  const seenPages = new Set<string>();
+  const seenDocuments = new Set<string>();
   const truncated = { value: false };
   let documents = 1;
 
   const addPages = (pages: string[]) => {
     for (const page of pages) {
+      if (seenPages.has(page)) continue;
       if (urls.length >= SITEMAP_LIMITS.maxCandidateUrls) {
         truncated.value = true;
         return;
       }
-      if (!seen.has(page)) {
-        seen.add(page);
-        urls.push(page);
-      }
+      seenPages.add(page);
+      urls.push(page);
     }
   };
 
   addPages(root.pageUrls);
-  const queue = [...root.sitemapUrls];
+  const queue = root.sitemapUrls.map((url) => ({ url, depth: 1 }));
   while (queue.length > 0 && documents < SITEMAP_LIMITS.maxDocuments && urls.length < SITEMAP_LIMITS.maxCandidateUrls) {
     const next = queue.shift();
-    if (!next || seen.has(next)) continue;
-    seen.add(next);
+    if (!next || seenDocuments.has(next.url)) continue;
+    if (next.depth > SITEMAP_LIMITS.maxDepth) {
+      truncated.value = true;
+      continue;
+    }
+    seenDocuments.add(next.url);
     documents += 1;
-    const child = fetchIndex(next);
+    const child = fetchIndex(next.url);
     if (!child) continue; // unreachable child sitemaps are skipped, not fatal
     addPages(child.pageUrls);
     for (const grandChild of child.sitemapUrls) {
-      if (documents + queue.length < SITEMAP_LIMITS.maxDocuments) queue.push(grandChild);
+      if (seenDocuments.has(grandChild) || queue.some((entry) => entry.url === grandChild)) continue;
+      if (documents + queue.length < SITEMAP_LIMITS.maxDocuments) {
+        queue.push({ url: grandChild, depth: next.depth + 1 });
+      } else {
+        truncated.value = true;
+      }
     }
   }
-  if (queue.length > 0 && documents >= SITEMAP_LIMITS.maxDocuments) truncated.value = true;
+  if (queue.length > 0) truncated.value = true;
   return { urls, truncated: truncated.value };
 }

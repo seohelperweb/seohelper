@@ -33,26 +33,6 @@ export async function createCrawl(
   if (!idempotencyKey || idempotencyKey.length > 200)
     throw ApiError.badRequest("Idempotency-Key header is required (max 200 chars)");
 
-  const project = await projects.findScoped(db, actor.workspaceId, projectId);
-  if (!project) throw ApiError.notFound("Project not found");
-  if (project.archivedAt) throw ApiError.conflict("Project is archived");
-  try {
-    assertProjectCrawlable(
-      {
-        id: project.id,
-        hostname: project.hostname,
-        verificationStatus: project.verificationStatus,
-        latestVerification: project.verifications[0] ?? null,
-      },
-      VERIFICATION_VALIDITY_MS,
-    );
-  } catch (error) {
-    if (error instanceof CrawlBlockedError) throw ApiError.conflict(error.message, "VERIFICATION_REQUIRED");
-    throw error;
-  }
-  const policyId = project.currentPolicyId;
-  if (!policyId) throw ApiError.conflict("Project has no active policy");
-
   const route = `POST /api/v1/workspaces/${actor.workspaceId}/projects/${projectId}/crawls`;
   const requestHash = createHash("sha256").update(`${route}:`, "utf8").digest("hex");
 
@@ -66,57 +46,73 @@ export async function createCrawl(
       requestHash,
       ttlMs: 24 * 60 * 60 * 1000,
     },
-    async () => {
-      const created = await db.$transaction(async (tx) => {
-        await projects.lockProject(tx, projectId);
-        const active = await tx.crawlRun.findFirst({
-          where: { projectId, status: { in: [...ACTIVE_RUN_STATUSES] } },
-          select: { id: true },
-        });
-        if (active) {
-          throw ApiError.conflict("A crawl is already active for this project", "CRAWL_ALREADY_ACTIVE");
-        }
-        // Manual-trigger quota (docs/ARCHITECTURE.md §7.3): ≤10 per day per
-        // project, at least 5 minutes between creations. Idempotent replays
-        // return before reaching here.
-        const now = new Date();
-        const dailyCount = await tx.crawlRun.count({
-          where: { projectId, trigger: "MANUAL", createdAt: { gte: new Date(now.getTime() - 24 * 60 * 60 * 1000) } },
-        });
-        if (dailyCount >= 10) {
-          throw ApiError.tooManyRequests("Daily manual crawl quota reached (10/day)", {
-            retryAfterMs: 24 * 60 * 60 * 1000,
-          });
-        }
-        const lastManual = await tx.crawlRun.findFirst({
-          where: { projectId, trigger: "MANUAL" },
-          orderBy: { createdAt: "desc" },
-          select: { createdAt: true },
-        });
-        if (lastManual) {
-          const nextAllowedAt = new Date(lastManual.createdAt.getTime() + 5 * 60 * 1000);
-          if (nextAllowedAt > now) {
-            throw ApiError.tooManyRequests("Manual crawls must be at least 5 minutes apart", { nextAllowedAt });
-          }
-        }
-        const pagesKnown = await tx.page.count({ where: { projectId } });
-        const run = await createRun(tx, { projectId, policyId, trigger: "MANUAL", baseRunId: null, pagesKnown });
-        await emit(tx, {
-          type: CRAWL_REQUESTED,
-          aggregateId: run.id,
-          payload: { workspaceId: actor.workspaceId, projectId, crawlId: run.id },
-        });
-        await recordAudit(tx, {
-          workspaceId: actor.workspaceId,
-          actorId: actor.userId,
-          action: "crawl.created",
-          resourceId: run.id,
-          requestId,
-          details: { projectId, trigger: "MANUAL" },
-        });
-        return run;
+    async (tx) => {
+      await projects.lockProject(tx, projectId);
+      const project = await projects.findScoped(tx, actor.workspaceId, projectId);
+      if (!project) throw ApiError.notFound("Project not found");
+      if (project.archivedAt) throw ApiError.conflict("Project is archived");
+      try {
+        assertProjectCrawlable(
+          {
+            id: project.id,
+            hostname: project.hostname,
+            verificationStatus: project.verificationStatus,
+            latestVerification: project.verifications[0] ?? null,
+          },
+          VERIFICATION_VALIDITY_MS,
+        );
+      } catch (error) {
+        if (error instanceof CrawlBlockedError) throw ApiError.conflict(error.message, "VERIFICATION_REQUIRED");
+        throw error;
+      }
+      const policyId = project.currentPolicyId;
+      if (!policyId) throw ApiError.conflict("Project has no active policy");
+      const active = await tx.crawlRun.findFirst({
+        where: { projectId, status: { in: [...ACTIVE_RUN_STATUSES] } },
+        select: { id: true },
       });
-      return created.id;
+      if (active) {
+        throw ApiError.conflict("A crawl is already active for this project", "CRAWL_ALREADY_ACTIVE");
+      }
+      // Manual-trigger quota (docs/ARCHITECTURE.md §7.3): ≤10 per day per
+      // project, at least 5 minutes between creations. Idempotent replays
+      // return before reaching here.
+      const now = new Date();
+      const dailyCount = await tx.crawlRun.count({
+        where: { projectId, trigger: "MANUAL", createdAt: { gte: new Date(now.getTime() - 24 * 60 * 60 * 1000) } },
+      });
+      if (dailyCount >= 10) {
+        throw ApiError.tooManyRequests("Daily manual crawl quota reached (10/day)", {
+          retryAfterMs: 24 * 60 * 60 * 1000,
+        });
+      }
+      const lastManual = await tx.crawlRun.findFirst({
+        where: { projectId, trigger: "MANUAL" },
+        orderBy: { createdAt: "desc" },
+        select: { createdAt: true },
+      });
+      if (lastManual) {
+        const nextAllowedAt = new Date(lastManual.createdAt.getTime() + 5 * 60 * 1000);
+        if (nextAllowedAt > now) {
+          throw ApiError.tooManyRequests("Manual crawls must be at least 5 minutes apart", { nextAllowedAt });
+        }
+      }
+      const pagesKnown = await tx.page.count({ where: { projectId } });
+      const run = await createRun(tx, { projectId, policyId, trigger: "MANUAL", baseRunId: null, pagesKnown });
+      await emit(tx, {
+        type: CRAWL_REQUESTED,
+        aggregateId: run.id,
+        payload: { workspaceId: actor.workspaceId, projectId, crawlId: run.id },
+      });
+      await recordAudit(tx, {
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        action: "crawl.created",
+        resourceId: run.id,
+        requestId,
+        details: { projectId, trigger: "MANUAL" },
+      });
+      return run.id;
     },
   );
 

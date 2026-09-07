@@ -112,7 +112,7 @@ function bothKnown(base: ComparableObservation, current: ComparableObservation, 
 }
 
 const canonicalValue = (canonical: { raw: string[]; resolved: string[] } | null): string | null =>
-  canonical === null ? null : canonical.resolved.join(" ");
+  canonical === null ? null : [...new Set(canonical.resolved)].sort().join(" ");
 
 /**
  * Compare a current run's observations against a published base run.

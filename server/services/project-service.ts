@@ -8,6 +8,7 @@ import { record as recordAudit } from "../repositories/audit.ts";
 import { VERIFICATION_REQUESTED, emit } from "../repositories/outbox.ts";
 import * as projects from "../repositories/projects.ts";
 import * as verifications from "../repositories/verifications.ts";
+import { ACTIVE_RUN_STATUSES } from "../repositories/crawls.ts";
 import {
   createChallengeValue,
   hashChallengeValue,
@@ -99,31 +100,42 @@ export async function getProject(db: DbClient, actor: ActorContext, projectId: s
 }
 
 export async function updateProject(
-  db: DbClient,
+  db: PrismaClient,
   actor: ActorContext,
   projectId: string,
   input: { displayName?: string | null; archived?: boolean },
   requestId?: string,
 ): Promise<ProjectDetail> {
   if (!can(actor.role, "manage-project")) throw ApiError.forbidden();
-  const existing = await projects.findScoped(db, actor.workspaceId, projectId);
-  if (!existing) throw ApiError.notFound("Project not found");
-  if (input.archived !== undefined && input.archived !== (existing.archivedAt !== null)) {
-    // P2 adds the "no active crawl" guard before archiving (docs §8).
-    await projects.update(db, projectId, { archivedAt: input.archived ? new Date() : null });
-    await recordAudit(db, {
-      workspaceId: actor.workspaceId,
-      actorId: actor.userId,
-      action: input.archived ? "project.archived" : "project.unarchived",
-      resourceId: projectId,
-      requestId,
+  return db.$transaction(async (tx) => {
+    await projects.lockProject(tx, projectId);
+    const existing = await projects.findScoped(tx, actor.workspaceId, projectId);
+    if (!existing) throw ApiError.notFound("Project not found");
+    const archiveChanged = input.archived !== undefined && input.archived !== (existing.archivedAt !== null);
+    if (archiveChanged && input.archived) {
+      const active = await tx.crawlRun.findFirst({
+        where: { projectId, status: { in: [...ACTIVE_RUN_STATUSES] } },
+        select: { id: true },
+      });
+      if (active) throw ApiError.conflict("A project with an active crawl cannot be archived", "CRAWL_ALREADY_ACTIVE");
+    }
+    await projects.update(tx, projectId, {
+      ...(archiveChanged ? { archivedAt: input.archived ? new Date() : null } : {}),
+      ...(input.displayName !== undefined ? { displayName: input.displayName?.trim() || null } : {}),
     });
-  } else if (input.displayName !== undefined) {
-    await projects.update(db, projectId, { displayName: input.displayName?.trim() || null });
-  }
-  const updated = await projects.findScoped(db, actor.workspaceId, projectId);
-  if (!updated) throw ApiError.notFound("Project not found");
-  return updated;
+    if (archiveChanged) {
+      await recordAudit(tx, {
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        action: input.archived ? "project.archived" : "project.unarchived",
+        resourceId: projectId,
+        requestId,
+      });
+    }
+    const updated = await projects.findScoped(tx, actor.workspaceId, projectId);
+    if (!updated) throw ApiError.notFound("Project not found");
+    return updated;
+  });
 }
 
 export interface VerificationRequestResult {

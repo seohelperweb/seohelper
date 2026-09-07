@@ -69,6 +69,23 @@ test("missing title distinguishes absent from unknown", () => {
   );
 });
 
+test("noindex requires known applicable robots evidence to confirm or resolve an issue", () => {
+  const validityStates: RuleObservation["fieldValidity"][] = [
+    null,
+    {},
+    { robots: "UNKNOWN" },
+    { robots: "NOT_APPLICABLE" },
+  ];
+  for (const fieldValidity of validityStates) {
+    for (const index of ["ALLOWED", "DISALLOWED"] as const) {
+      assert.equal(
+        evaluateIssueRule("noindex_on_indexable", observation({ fieldValidity, robots: { raw: [], index } })).verdict,
+        "UNKNOWN",
+      );
+    }
+  }
+});
+
 test("canonical rule flags invalid and conflicting values; absence is fine", () => {
   assert.equal(
     evaluateIssueRule("canonical_conflict", observation({ canonical: { raw: [], resolved: [] } })).verdict,
@@ -86,6 +103,22 @@ test("canonical rule flags invalid and conflicting values; absence is fine", () 
     "PRESENT",
   );
   assert.equal(evaluateIssueRule("canonical_conflict", observation()).verdict, "ABSENT");
+  assert.equal(
+    evaluateIssueRule(
+      "canonical_conflict",
+      observation({ canonical: { raw: ["/a", "http://[invalid"], resolved: ["https://example.com/a"] } }),
+    ).verdict,
+    "PRESENT",
+    "a valid candidate must not hide another candidate with invalid syntax",
+  );
+  assert.equal(
+    evaluateIssueRule(
+      "canonical_conflict",
+      observation({ canonical: { raw: ["/a", "/a"], resolved: ["https://example.com/a", "https://example.com/a"] } }),
+    ).verdict,
+    "ABSENT",
+    "identical valid declarations do not conflict",
+  );
   assert.equal(
     evaluateIssueRule("canonical_conflict", observation({ canonical: null, fieldValidity: { canonical: "UNKNOWN" } }))
       .verdict,

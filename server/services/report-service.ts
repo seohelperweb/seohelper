@@ -29,9 +29,17 @@ export async function getOverview(db: DbClient, actor: ActorContext, projectId: 
       where: { projectId, status: { in: [...ACTIVE_RUN_STATUSES] } },
       select: { id: true, status: true, pagesDone: true, pagesKnown: true },
     }),
-    db.issue.count({
-      where: { projectId, state: "OPEN", OR: [{ suppressedUntil: null }, { suppressedUntil: { lt: new Date() } }] },
-    }),
+    project.currentPolicy
+      ? db.issue.count({
+          where: {
+            projectId,
+            scopeGeneration: project.currentPolicy.scopeGeneration,
+            ruleVersion: project.currentPolicy.ruleVersion,
+            state: "OPEN",
+            OR: [{ suppressedUntil: null }, { suppressedUntil: { lte: new Date() } }],
+          },
+        })
+      : 0,
     db.crawlRun.findFirst({
       where: { projectId, status: { in: ["FAILED", "CANCELLED"] }, publishedAt: null },
       orderBy: { createdAt: "desc" },
@@ -118,7 +126,7 @@ export async function listChanges(
   const typeWhere = filter.type ? { type: filter.type } : {};
   const items = await db.changeEvent.findMany({
     where: { runId: run.id, ...severityWhere, ...typeWhere, ...(page.where ?? {}) },
-    orderBy: [{ severity: "asc" }, { id: "asc" }],
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: page.take + 1,
     include: { page: { select: { identityUrl: true } } },
   });
@@ -148,6 +156,7 @@ export async function listIssues(
   page: { where?: object; take: number },
 ) {
   const project = await requireProject(db, actor, projectId);
+  if (!project.currentPolicy) return { items: [], nextCursor: null };
   const stateWhere =
     filter.state === "RESOLVED"
       ? { state: "RESOLVED" as const }
@@ -155,8 +164,14 @@ export async function listIssues(
         ? {}
         : { state: "OPEN" as const };
   const items = await db.issue.findMany({
-    where: { projectId: project.id, ...stateWhere, ...(page.where ?? {}) },
-    orderBy: [{ state: "asc" }, { updatedAt: "desc" }],
+    where: {
+      projectId: project.id,
+      scopeGeneration: project.currentPolicy.scopeGeneration,
+      ruleVersion: project.currentPolicy.ruleVersion,
+      ...stateWhere,
+      ...(page.where ?? {}),
+    },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: page.take + 1,
     include: { page: { select: { identityUrl: true } } },
   });
@@ -175,7 +190,7 @@ export async function listIssues(
       updatedAt: issue.updatedAt,
       url: issue.page.identityUrl,
     })),
-    nextCursor: hasMore && last ? encodeCursor({ createdAt: last.updatedAt, id: last.id }) : null,
+    nextCursor: hasMore && last ? encodeCursor({ createdAt: last.createdAt, id: last.id }) : null,
   };
 }
 

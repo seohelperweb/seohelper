@@ -101,32 +101,28 @@ export function robotsRuleMatches(pattern: string, pathWithQuery: string): numbe
     pos = found + segments[i].length;
   }
 
-  // Last segment must match at the end of the path.
+  // Only `$` anchors the last segment; an ordinary rule is a prefix match.
   const last = segments[segments.length - 1];
   if (last === "") return pattern.length; // trailing `*`
+  if (!anchoredEnd) return pathWithQuery.indexOf(last, pos) === -1 ? -1 : pattern.length;
   const lastIndex = pathWithQuery.length - last.length;
   if (lastIndex < pos || !startsWith(last, lastIndex)) return -1;
   return pattern.length;
 }
 
-function selectGroup(robots: ParsedRobots, userAgent: string): RobotsGroup | null {
+function selectGroups(robots: ParsedRobots, userAgent: string): RobotsGroup[] {
   const ua = userAgent.toLowerCase();
-  let star: RobotsGroup | null = null;
-  for (const group of robots.groups) {
-    if (group.agents.includes(ua)) return group;
-    if (group.agents.includes("*")) star = star ?? group;
-  }
-  return star;
+  const matching = robots.groups.filter((group) => group.agents.includes(ua));
+  return matching.length > 0 ? matching : robots.groups.filter((group) => group.agents.includes("*"));
 }
 
 export function isAllowedByRobots(robots: ParsedRobots, userAgent: string, url: URL): boolean {
-  const group = selectGroup(robots, userAgent);
-  if (!group) return true; // no applicable group → unrestricted (RFC 9309 §2.2.1)
+  const groups = selectGroups(robots, userAgent);
   const pathWithQuery = `${url.pathname}${url.search}`;
 
   let bestLength = -1;
   let bestAllow = true; // default allow when no rule matches
-  for (const rule of group.rules) {
+  for (const rule of groups.flatMap((group) => group.rules)) {
     if (rule.path === "") continue; // "Disallow:" with empty value allows everything
     const matched = robotsRuleMatches(rule.path, pathWithQuery);
     if (matched > bestLength || (matched === bestLength && rule.allow)) {

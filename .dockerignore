@@ -1,9 +1,9 @@
 node_modules
+**/node_modules
 .next
-out
+.git
+.mimosa
 .env*
 !.env.example
 *.log
 tsconfig.tsbuildinfo
-.mimosa
-gui-test-screenshots/

@@ -10,6 +10,11 @@ import { createCrawl } from "../../server/services/crawl-service.ts";
 import { createProject, requestVerification } from "../../server/services/project-service.ts";
 import { processVerificationJob } from "../../server/services/verification-runner.ts";
 import { claimBatch, VERIFICATION_REQUESTED } from "../../server/repositories/outbox.ts";
+import { getOverview, listChanges, listIssues } from "../../server/services/report-service.ts";
+import { updateIssueSuppression } from "../../server/services/issue-service.ts";
+import { pageParams } from "../../server/api/page-params.ts";
+import { ApiError } from "../../server/api/errors.ts";
+import { publishRun } from "../../server/crawl/publisher.ts";
 
 const HOSTNAME = `report-${uniqueId()}.test`;
 
@@ -370,6 +375,188 @@ test("health score is suppressed when decisive coverage is insufficient", async 
     components.every((component) => component.deduction === 0),
     true,
   );
+});
+
+test("report cursors visit every change and issue once, including equal timestamps", async () => {
+  const client = db();
+  const context = await setup();
+  const ownerActor = actor(context.owner.id, context.workspaceId, "OWNER");
+  deploySiteV1();
+  await runCrawl(context, "pagination-baseline");
+  deploySiteV2();
+  const runId = await runCrawl(context, "pagination-diff");
+  const timestamp = new Date("2025-01-01T00:00:00Z");
+  await client.changeEvent.updateMany({ where: { runId }, data: { createdAt: timestamp } });
+  await client.issue.updateMany({
+    where: { projectId: context.projectId },
+    data: { createdAt: timestamp, updatedAt: new Date("2025-02-01T00:00:00Z") },
+  });
+
+  for (const kind of ["changes", "issues"] as const) {
+    const expected =
+      kind === "changes"
+        ? await client.changeEvent.findMany({ where: { runId }, select: { id: true }, orderBy: { id: "desc" } })
+        : await client.issue.findMany({
+            where: { projectId: context.projectId },
+            select: { id: true },
+            orderBy: { id: "desc" },
+          });
+    const visited: string[] = [];
+    let cursor: string | null = null;
+    for (let request = 0; request <= expected.length; request += 1) {
+      const url = new URL(`https://app.example.test/${kind}?limit=1`);
+      if (cursor) url.searchParams.set("cursor", cursor);
+      const page =
+        kind === "changes"
+          ? await listChanges(client, ownerActor, context.projectId, { runId }, pageParams(url))
+          : await listIssues(client, ownerActor, context.projectId, { state: "ALL" }, pageParams(url));
+      visited.push(...page.items.map((item) => item.id));
+      cursor = page.nextCursor;
+      if (!cursor) break;
+    }
+    assert.equal(cursor, null, `${kind} pagination must terminate`);
+    assert.deepEqual(
+      visited,
+      expected.map((item) => item.id),
+      `${kind} must not omit or repeat rows`,
+    );
+  }
+});
+
+test("current issue reads exclude prior policy scopes and rule versions", async () => {
+  const client = db();
+  const context = await setup();
+  const ownerActor = actor(context.owner.id, context.workspaceId, "OWNER");
+  deploySiteV1();
+  await runCrawl(context, "issue-scope");
+  const issue = await client.issue.findFirstOrThrow({ where: { projectId: context.projectId } });
+  for (const version of [
+    { scopeGeneration: issue.scopeGeneration + 1, ruleVersion: issue.ruleVersion },
+    { scopeGeneration: issue.scopeGeneration, ruleVersion: issue.ruleVersion + 1 },
+  ]) {
+    await client.issue.create({
+      data: { projectId: issue.projectId, pageId: issue.pageId, ruleKey: issue.ruleKey, ...version },
+    });
+  }
+  const overview = await getOverview(client, ownerActor, context.projectId);
+  assert.equal(overview.openIssues, 2);
+  const issues = await listIssues(client, ownerActor, context.projectId, { state: "ALL" }, { take: 50 });
+  assert.equal(issues.items.length, 2);
+});
+
+test("issue suppression rejects another workspace and records authorized changes atomically", async () => {
+  const client = db();
+  const context = await setup();
+  deploySiteV1();
+  await runCrawl(context, "suppression-isolation");
+  const issue = await client.issue.findFirstOrThrow({ where: { projectId: context.projectId } });
+  const outsider = await createUser(client);
+  const outsiderWorkspaceId = await createWorkspaceWithOwner(client, outsider);
+  const until = new Date(Date.now() + 86_400_000);
+  const assertNotFound = (error: unknown) => error instanceof ApiError && error.status === 404;
+  await assert.rejects(
+    updateIssueSuppression(client, actor(outsider.id, outsiderWorkspaceId, "OWNER"), context.projectId, issue.id, {
+      suppressedUntil: until,
+    }),
+    assertNotFound,
+  );
+  assert.equal((await client.issue.findUniqueOrThrow({ where: { id: issue.id } })).suppressedUntil, null);
+  assert.equal(await client.auditLog.count({ where: { resourceId: issue.id } }), 0);
+
+  const ownerActor = actor(context.owner.id, context.workspaceId, "OWNER");
+  await updateIssueSuppression(client, ownerActor, context.projectId, issue.id, { suppressedUntil: until });
+  assert.deepEqual((await client.issue.findUniqueOrThrow({ where: { id: issue.id } })).suppressedUntil, until);
+  assert.equal(await client.auditLog.count({ where: { resourceId: issue.id, action: "issue.suppressed" } }), 1);
+  assert.equal((await getOverview(client, ownerActor, context.projectId)).openIssues, 1);
+
+  // PostgreSQL text cannot contain NUL. A failed audit write must roll the
+  // overlay back as well, even though its update has already succeeded.
+  await assert.rejects(
+    updateIssueSuppression(
+      client,
+      ownerActor,
+      context.projectId,
+      issue.id,
+      { suppressedUntil: null },
+      "invalid\u0000request-id",
+    ),
+  );
+  assert.deepEqual((await client.issue.findUniqueOrThrow({ where: { id: issue.id } })).suppressedUntil, until);
+});
+
+test("publication refuses cancelled runs, cancellation requests, and unfinished crawls", async () => {
+  const client = db();
+  const context = await setup();
+  const project = await client.project.findUniqueOrThrow({ where: { id: context.projectId } });
+  for (const state of [
+    { status: "CANCELLED", cancelRequestedAt: null },
+    { status: "RUNNING", cancelRequestedAt: null },
+    { status: "FINALIZING", cancelRequestedAt: new Date() },
+  ] as const) {
+    const run = await client.crawlRun.create({
+      data: { projectId: project.id, policyId: project.currentPolicyId!, leaseToken: 1, ...state },
+    });
+    const outcome = await publishRun(client, { projectId: project.id, runId: run.id, leaseToken: 1 });
+    assert.equal(outcome.published, false, `${state.status} must not publish`);
+    assert.equal(await client.crawlSummary.count({ where: { runId: run.id } }), 0);
+    assert.equal((await client.crawlRun.findUniqueOrThrow({ where: { id: run.id } })).publishedAt, null);
+    assert.equal((await client.project.findUniqueOrThrow({ where: { id: project.id } })).latestPublishedRunId, null);
+    await client.crawlRun.update({ where: { id: run.id }, data: { status: "CANCELLED" } });
+  }
+});
+
+test("publication evaluates the run's immutable policy and repeated publication is idempotent", async () => {
+  const client = db();
+  const context = await setup();
+  const project = await client.project.findUniqueOrThrow({
+    where: { id: context.projectId },
+    include: { currentPolicy: true },
+  });
+  const policy = project.currentPolicy!;
+  const run = await client.crawlRun.create({
+    data: { projectId: project.id, policyId: policy.id, status: "FINALIZING", leaseToken: 1 },
+  });
+  const page = await client.page.create({
+    data: {
+      projectId: project.id,
+      identityVersion: policy.identityVersion,
+      identityUrl: `https://${HOSTNAME}/`,
+      urlKey: uniqueId(),
+    },
+  });
+  await client.pageObservation.create({
+    data: {
+      runId: run.id,
+      pageId: page.id,
+      requestUrl: page.identityUrl,
+      fetchOutcome: "HTTP_RESPONSE",
+      initialStatus: 200,
+      finalStatus: 200,
+      title: null,
+      fieldValidity: { title: "KNOWN" },
+    },
+  });
+  const newerPolicy = await client.projectPolicy.create({
+    data: {
+      projectId: project.id,
+      version: policy.version + 1,
+      scopeGeneration: policy.scopeGeneration + 1,
+      ruleVersion: policy.ruleVersion + 1,
+      identityVersion: policy.identityVersion,
+      extractorVersion: policy.extractorVersion,
+      config: policy.config as object,
+      policyHash: `new-${uniqueId()}`,
+    },
+  });
+  await client.project.update({ where: { id: project.id }, data: { currentPolicyId: newerPolicy.id } });
+  const input = { projectId: project.id, runId: run.id, leaseToken: 1 };
+  const first = await publishRun(client, input);
+  assert.equal(first.published, true);
+  const issue = await client.issue.findFirstOrThrow({ where: { projectId: project.id, ruleKey: "missing_title" } });
+  assert.equal(issue.scopeGeneration, policy.scopeGeneration);
+  assert.equal(issue.ruleVersion, policy.ruleVersion);
+  assert.deepEqual(await publishRun(client, input), first);
+  assert.equal(await client.issueTransition.count({ where: { runId: run.id } }), 1);
 });
 
 export {};

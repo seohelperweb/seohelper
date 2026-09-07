@@ -11,8 +11,27 @@ test("rule matcher honours longest match, wildcards, and end anchor", () => {
   assert.equal(robotsRuleMatches("/*.php$", "/a/b.php"), 7);
   assert.equal(robotsRuleMatches("/*.php$", "/a/b.php?x=1"), -1);
   assert.equal(robotsRuleMatches("/a*/c", "/a/b/c"), 5);
+  assert.equal(robotsRuleMatches("/a*/c", "/a/b/c/d"), 5);
+  assert.equal(robotsRuleMatches("/*.php", "/page.php?secret=1"), 6);
   assert.equal(robotsRuleMatches("", "/anything"), -1);
   assert.equal(robotsRuleMatches("/x", "/y"), -1);
+});
+
+test("combines all matching groups and ignores wildcard groups when an agent matches", () => {
+  const robots = parseRobots(`User-agent: IndexlyBot
+Disallow: /first
+User-agent: IndexlyBot
+Disallow: /second
+User-agent: *
+Disallow: /fallback
+User-agent: *
+Disallow: /another-fallback`);
+  const url = (path: string) => new URL(`https://example.com${path}`);
+  assert.equal(isAllowedByRobots(robots, "IndexlyBot", url("/first")), false);
+  assert.equal(isAllowedByRobots(robots, "IndexlyBot", url("/second")), false);
+  assert.equal(isAllowedByRobots(robots, "IndexlyBot", url("/fallback")), true);
+  assert.equal(isAllowedByRobots(robots, "OtherBot", url("/fallback")), false);
+  assert.equal(isAllowedByRobots(robots, "OtherBot", url("/another-fallback")), false);
 });
 
 test("parses groups, comments, sitemaps, and empty disallow", () => {

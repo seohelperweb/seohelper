@@ -68,26 +68,53 @@ export default function Dashboard() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [schedule, setSchedule] = useState<{ enabled: boolean; nextRunAt: string | null } | null>(null);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const projectRequest = useRef(0);
+  const dataRequest = useRef(0);
+  const selectionVersion = useRef(0);
 
   const project = projects.find((p) => p.id === projectId) ?? null;
   const currentWorkspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+  const canManage = currentWorkspace?.role === "OWNER" || currentWorkspace?.role === "ADMIN";
+  const canCrawl = canManage || currentWorkspace?.role === "MEMBER";
+  const verificationValid = project?.verificationStatus === "ACTIVE" && project.verification?.valid === true;
+
+  const clearProjectData = useCallback(() => {
+    selectionVersion.current += 1;
+    dataRequest.current += 1;
+    if (pollTimer.current) clearTimeout(pollTimer.current);
+    setOverview(null);
+    setChanges([]);
+    setIssues([]);
+    setCrawls([]);
+    setSchedule(null);
+  }, []);
 
   const loadProjectData = useCallback(async (wsId: string, pId: string) => {
-    const base = `/api/v1/workspaces/${wsId}/projects/${pId}`;
-    const [overviewData, changesData, issuesData, crawlsData, scheduleData] = await Promise.all([
-      api<Overview>(`${base}/overview`),
-      api<{ items: ChangeItem[] }>(`${base}/changes`),
-      api<{ items: IssueItem[] }>(`${base}/issues`),
-      api<{ items: CrawlItem[] }>(`${base}/crawls?limit=10`),
-      api<{ enabled: boolean; nextRunAt: string | null }>(`${base}/schedule`),
-    ]);
-    setOverview(overviewData);
-    setChanges(changesData.items);
-    setIssues(issuesData.items);
-    setCrawls(crawlsData.items);
-    setSchedule(scheduleData);
+    const request = ++dataRequest.current;
     if (pollTimer.current) clearTimeout(pollTimer.current);
-    if (overviewData.activeRun) {
+    const base = `/api/v1/workspaces/${wsId}/projects/${pId}`;
+    try {
+      const [overviewData, changesData, issuesData, crawlsData, scheduleData, projectData] = await Promise.all([
+        api<Overview>(`${base}/overview`),
+        api<{ items: ChangeItem[] }>(`${base}/changes`),
+        api<{ items: IssueItem[] }>(`${base}/issues`),
+        api<{ items: CrawlItem[] }>(`${base}/crawls?limit=10`),
+        api<{ enabled: boolean; nextRunAt: string | null }>(`${base}/schedule`),
+        api<ProjectSummary>(base),
+      ]);
+      if (request !== dataRequest.current) return;
+      setOverview(overviewData);
+      setChanges(changesData.items);
+      setIssues(issuesData.items);
+      setCrawls(crawlsData.items);
+      setSchedule(scheduleData);
+      setProjects((items) => items.map((item) => (item.id === pId ? projectData : item)));
+      if (overviewData.activeRun || projectData.activeChallenge) {
+        pollTimer.current = setTimeout(() => void loadProjectData(wsId, pId), 3000);
+      }
+    } catch (error) {
+      if (request !== dataRequest.current) return;
+      setToast(error instanceof Error ? error.message : "项目数据加载失败");
       pollTimer.current = setTimeout(() => void loadProjectData(wsId, pId), 3000);
     }
   }, []);
@@ -103,33 +130,43 @@ export default function Dashboard() {
     }
   }, []);
 
-  const loadProjects = useCallback(async (wsId: string) => {
-    const data = await api<{ items: ProjectSummary[] }>(`/api/v1/workspaces/${wsId}/projects`);
-    setProjects(data.items);
-    const stored = localStorage.getItem(`indexly.project.${wsId}`);
-    const selected = data.items.find((p) => p.id === stored) ?? data.items[0];
-    if (selected) {
-      setProjectId(selected.id);
-    } else {
-      setProjectId(null);
-      setOverview(null);
-      setChanges([]);
-      setIssues([]);
-      setCrawls([]);
-    }
-  }, []);
+  const loadProjects = useCallback(
+    async (wsId: string, preferredId?: string) => {
+      const request = ++projectRequest.current;
+      const data = await api<{ items: ProjectSummary[] }>(`/api/v1/workspaces/${wsId}/projects`);
+      if (request !== projectRequest.current) return;
+      setProjects(data.items);
+      const stored = preferredId ?? localStorage.getItem(`indexly.project.${wsId}`);
+      const selected = data.items.find((p) => p.id === stored) ?? data.items[0];
+      if (selected) {
+        setProjectId(selected.id);
+        localStorage.setItem(`indexly.project.${wsId}`, selected.id);
+      } else {
+        setProjectId(null);
+        clearProjectData();
+      }
+    },
+    [clearProjectData],
+  );
 
   useEffect(() => {
-    loadWorkspaces().catch(() => undefined);
+    loadWorkspaces().catch((error: unknown) => setToast(error instanceof Error ? error.message : "工作区加载失败"));
   }, [loadWorkspaces]);
 
   useEffect(() => {
-    if (workspaceId) void loadProjects(workspaceId).catch(() => undefined);
+    if (workspaceId)
+      void loadProjects(workspaceId).catch((error: unknown) =>
+        setToast(error instanceof Error ? error.message : "项目列表加载失败"),
+      );
+    return () => {
+      projectRequest.current += 1;
+    };
   }, [workspaceId, loadProjects]);
 
   useEffect(() => {
     if (workspaceId && projectId) void loadProjectData(workspaceId, projectId).catch(() => undefined);
     return () => {
+      dataRequest.current += 1;
       if (pollTimer.current) clearTimeout(pollTimer.current);
     };
   }, [workspaceId, projectId, loadProjectData]);
@@ -144,7 +181,7 @@ export default function Dashboard() {
       });
       setNewWorkspaceName("");
       await loadWorkspaces();
-      setWorkspaceId(created.id);
+      selectWorkspace(created.id);
       setToast(`工作区「${created.name}」已创建`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "创建失败");
@@ -156,13 +193,15 @@ export default function Dashboard() {
   const createProject = async () => {
     if (!workspaceId || !newHostname.trim()) return;
     setBusy(true);
+    const selection = selectionVersion.current;
     try {
-      await api<unknown>(`/api/v1/workspaces/${workspaceId}/projects`, {
+      const created = await api<ProjectSummary>(`/api/v1/workspaces/${workspaceId}/projects`, {
         method: "POST",
         body: JSON.stringify({ hostname: newHostname.trim() }),
       });
       setNewHostname("");
-      await loadProjects(workspaceId);
+      if (selection !== selectionVersion.current) return;
+      await loadProjects(workspaceId, created.id);
       setToast("项目已创建，请先完成域名验证");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "创建失败");
@@ -174,9 +213,10 @@ export default function Dashboard() {
   const requestVerification = async () => {
     if (!workspaceId || !projectId) return;
     setBusy(true);
+    const selection = selectionVersion.current;
     try {
       await api<unknown>(`/api/v1/workspaces/${workspaceId}/projects/${projectId}/verification`, { method: "POST" });
-      await loadProjects(workspaceId);
+      if (selection !== selectionVersion.current) return;
       await loadProjectData(workspaceId, projectId);
       setToast("已发起验证：添加 TXT 记录后，后台会自动重试检查");
     } catch (error) {
@@ -189,11 +229,13 @@ export default function Dashboard() {
   const runCrawl = async () => {
     if (!workspaceId || !projectId) return;
     setBusy(true);
+    const selection = selectionVersion.current;
     try {
       await api<unknown>(`/api/v1/workspaces/${workspaceId}/projects/${projectId}/crawls`, {
         method: "POST",
         headers: { "idempotency-key": crypto.randomUUID() },
       });
+      if (selection !== selectionVersion.current) return;
       setToast("抓取已开始");
       await loadProjectData(workspaceId, projectId);
     } catch (error) {
@@ -204,12 +246,19 @@ export default function Dashboard() {
   };
 
   const selectWorkspace = (id: string) => {
+    if (id === workspaceId) return;
+    projectRequest.current += 1;
+    clearProjectData();
+    setProjects([]);
+    setProjectId(null);
     setWorkspaceId(id);
     setMenuOpen(false);
     localStorage.setItem("indexly.workspace", id);
   };
 
   const selectProject = (id: string) => {
+    if (id === projectId) return;
+    clearProjectData();
     setProjectId(id);
     setMenuOpen(false);
     if (workspaceId) localStorage.setItem(`indexly.project.${workspaceId}`, id);
@@ -218,11 +267,13 @@ export default function Dashboard() {
   const toggleSchedule = async () => {
     if (!workspaceId || !projectId) return;
     setBusy(true);
+    const selection = selectionVersion.current;
     try {
       const updated = await api<{ enabled: boolean; nextRunAt: string | null }>(
         `/api/v1/workspaces/${workspaceId}/projects/${projectId}/schedule`,
         { method: "PUT", body: JSON.stringify({ enabled: !(schedule?.enabled ?? false) }) },
       );
+      if (selection !== selectionVersion.current) return;
       setSchedule(updated);
       setToast(
         updated.enabled
@@ -341,7 +392,7 @@ export default function Dashboard() {
             <button
               className="run"
               onClick={runCrawl}
-              disabled={busy || !project || (overview?.activeRun ?? null) !== null}
+              disabled={busy || !canCrawl || !verificationValid || !overview || (overview.activeRun ?? null) !== null}
             >
               <Play fill="currentColor" />
               {overview?.activeRun ? "抓取中…" : "运行抓取"}
@@ -366,14 +417,14 @@ export default function Dashboard() {
               <p>输入要监控的精确主机名（例如 example.com）。创建后需通过 DNS TXT 验证域名所有权，验证有效期 30 天。</p>
               <div className="new-item">
                 <input placeholder="example.com" value={newHostname} onChange={(e) => setNewHostname(e.target.value)} />
-                <button type="button" onClick={createProject} disabled={busy || !workspaceId}>
+                <button type="button" onClick={createProject} disabled={busy || !workspaceId || !canManage}>
                   创建项目
                 </button>
               </div>
             </section>
           )}
 
-          {project && project.verificationStatus !== "ACTIVE" && (
+          {project && !verificationValid && (
             <section className="banner warn">
               <h2>域名待验证</h2>
               {project.activeChallenge ? (
@@ -394,13 +445,17 @@ export default function Dashboard() {
                   {project.verification?.lastError ? `，上次验证失败：${project.verification.lastError}` : "。"}
                 </p>
               )}
-              <button className="run" onClick={requestVerification} disabled={busy || project.activeChallenge !== null}>
+              <button
+                className="run"
+                onClick={requestVerification}
+                disabled={busy || !canManage || project.activeChallenge !== null}
+              >
                 {project.activeChallenge ? "验证进行中…" : "发起域名验证"}
               </button>
             </section>
           )}
 
-          {overview?.firstBaselinePending && project?.verificationStatus === "ACTIVE" && (
+          {overview?.firstBaselinePending && verificationValid && (
             <section className="banner">
               <h2>等待首次基线</h2>
               <p>
@@ -595,7 +650,7 @@ export default function Dashboard() {
                 <button
                   className="run"
                   onClick={toggleSchedule}
-                  disabled={busy || !project || project.verificationStatus !== "ACTIVE"}
+                  disabled={busy || !canManage || !schedule || (!schedule.enabled && !verificationValid)}
                 >
                   {schedule?.enabled ? "停用" : "启用每周抓取"}
                 </button>
@@ -656,7 +711,12 @@ export default function Dashboard() {
             </>
           )}
           {currentWorkspace && (
-            <MembersPanel workspaceId={currentWorkspace.id} currentRole={currentWorkspace.role} onToast={setToast} />
+            <MembersPanel
+              key={currentWorkspace.id}
+              workspaceId={currentWorkspace.id}
+              currentRole={currentWorkspace.role}
+              onToast={setToast}
+            />
           )}
           <footer>
             <span>Indexly 按你的策略监控站点变更。</span>

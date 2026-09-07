@@ -16,22 +16,32 @@ export default function RegisterPage() {
     event.preventDefault();
     setError(null);
     setPending(true);
-    const { error } = await authClient.signUp.email({ name, email, password, callbackURL: "/login" });
-    setPending(false);
-    if (error) {
-      setError(error.message ?? "注册失败，请重试");
-      return;
+    try {
+      const { error } = await authClient.signUp.email({ name, email, password, callbackURL: "/login" });
+      if (error) {
+        setError(error.message ?? "注册失败，请重试");
+        return;
+      }
+      setSent(true);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "注册失败，请重试");
+    } finally {
+      setPending(false);
     }
-    setSent(true);
   };
 
   const resend = async () => {
-    if (!email) return;
-    await fetch("/api/auth/email-verification/send-verification-email", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, callbackURL: "/login" }),
-    });
+    if (!email || pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      const { error } = await authClient.sendVerificationEmail({ email, callbackURL: "/login" });
+      if (error) setError(error.message ?? "发送失败，请重试");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "发送失败，请重试");
+    } finally {
+      setPending(false);
+    }
   };
 
   return (
@@ -43,8 +53,14 @@ export default function RegisterPage() {
         {sent ? (
           <div className="auth-ok">
             验证邮件已发送到 {email}。开发环境下链接会打印在服务端控制台。
-            <button type="button" className="auth-link" onClick={resend} style={{ background: "none", border: 0 }}>
-              重新发送
+            <button
+              type="button"
+              className="auth-link"
+              onClick={resend}
+              disabled={pending}
+              style={{ background: "none", border: 0 }}
+            >
+              {pending ? "发送中…" : "重新发送"}
             </button>
           </div>
         ) : (

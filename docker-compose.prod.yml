@@ -50,7 +50,9 @@ services:
     environment:
       DATABASE_URL: postgresql://indexly:${POSTGRES_PASSWORD}@postgres:5432/indexly
       APP_ENV: production
+      APP_ORIGIN: ${APP_ORIGIN:?set APP_ORIGIN}
       AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET}
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-IndexlyBot/0.1}
       LOG_LEVEL: info
     depends_on:
       postgres:

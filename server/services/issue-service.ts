@@ -1,8 +1,9 @@
-import type { DbClient } from "@seo/db";
+import type { PrismaClient } from "@seo/db";
 import { ApiError } from "../api/errors.ts";
 import type { ActorContext } from "../auth/actor.ts";
 import { can } from "../auth/permissions.ts";
 import { record as recordAudit } from "../repositories/audit.ts";
+import { lockProject } from "../repositories/projects.ts";
 
 /**
  * Issue suppression (docs/ARCHITECTURE.md §9-10): suppressing is an
@@ -12,7 +13,7 @@ import { record as recordAudit } from "../repositories/audit.ts";
  */
 
 export async function updateIssueSuppression(
-  db: DbClient,
+  db: PrismaClient,
   actor: ActorContext,
   projectId: string,
   issueId: string,
@@ -20,16 +21,22 @@ export async function updateIssueSuppression(
   requestId?: string,
 ) {
   if (!can(actor.role, "run-crawl")) throw ApiError.forbidden();
-  const issue = await db.issue.findFirst({ where: { id: issueId, projectId } });
-  if (!issue) throw ApiError.notFound("Issue not found");
-  await db.issue.update({ where: { id: issue.id }, data: { suppressedUntil: input.suppressedUntil } });
-  await recordAudit(db, {
-    workspaceId: actor.workspaceId,
-    actorId: actor.userId,
-    action: input.suppressedUntil ? "issue.suppressed" : "issue.unsuppressed",
-    resourceId: issue.id,
-    requestId,
-    details: { ruleKey: issue.ruleKey, suppressedUntil: input.suppressedUntil?.toISOString() ?? null },
+  return db.$transaction(async (tx) => {
+    const issue = await tx.issue.findFirst({
+      where: { id: issueId, projectId, project: { workspaceId: actor.workspaceId } },
+    });
+    if (!issue) throw ApiError.notFound("Issue not found");
+    // Publication uses the same project lock when reading suppression settings.
+    await lockProject(tx, projectId);
+    await tx.issue.update({ where: { id: issue.id }, data: { suppressedUntil: input.suppressedUntil } });
+    await recordAudit(tx, {
+      workspaceId: actor.workspaceId,
+      actorId: actor.userId,
+      action: input.suppressedUntil ? "issue.suppressed" : "issue.unsuppressed",
+      resourceId: issue.id,
+      requestId,
+      details: { ruleKey: issue.ruleKey, suppressedUntil: input.suppressedUntil?.toISOString() ?? null },
+    });
+    return { id: issue.id, suppressedUntil: input.suppressedUntil };
   });
-  return { id: issue.id, suppressedUntil: input.suppressedUntil };
 }

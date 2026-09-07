@@ -59,6 +59,7 @@ test("successful TXT match verifies the project for 30 days", async () => {
 
   const verification = await client.domainVerification.findFirstOrThrow({ where: { projectId: fixture.projectId } });
   assert.equal(verification.status, "SUCCEEDED");
+  assert.equal(verification.attempts, 1);
   assert.deepEqual(verification.verifiedAt, now);
   assert.deepEqual(verification.expiresAt, new Date("2026-10-06T12:00:00Z"));
 
@@ -90,8 +91,52 @@ test("mismatched TXT retries with backoff and fails after max attempts", async (
 
   row = await client.domainVerification.findFirstOrThrow({ where: { projectId: fixture.projectId } });
   assert.equal(row.status, "FAILED");
+  assert.equal(row.attempts, VERIFICATION_MAX_ATTEMPTS);
   const project = await client.project.findUniqueOrThrow({ where: { id: fixture.projectId } });
   assert.equal(project.verificationStatus, "PENDING_VERIFICATION");
+});
+
+test("a DNS result cannot overwrite a verification after another worker takes its claim", async () => {
+  const { client, workspaceId, owner, fixture } = await setupProject();
+  const request = await requestVerification(client, actor(owner.id, workspaceId, "OWNER"), fixture.projectId);
+  const event = await claimOne(client);
+  let newerOutcome: string | undefined;
+  const staleOutcome = await processVerificationJob(client, event, async () => {
+    // The first DNS call is still in flight when its lease expires and a new
+    // worker completes the same challenge with a negative result.
+    await client.outboxEvent.update({ where: { id: event.id }, data: { claimUntil: new Date(0) } });
+    const replacement = await claimOne(client);
+    assert.notEqual(replacement.claimToken, event.claimToken);
+    newerOutcome = await processVerificationJob(client, replacement, async () => []);
+    return [[request.recordValue]];
+  });
+  assert.equal(newerOutcome, "rescheduled");
+  assert.equal(staleOutcome, "delivered");
+  const verification = await client.domainVerification.findUniqueOrThrow({ where: { id: request.verificationId } });
+  assert.equal(verification.status, "PENDING");
+  assert.equal(verification.verifiedAt, null);
+  assert.equal(verification.attempts, 2);
+  const project = await client.project.findUniqueOrThrow({ where: { id: fixture.projectId } });
+  assert.equal(project.verificationStatus, "PENDING_VERIFICATION");
+  // Do not leave a claimable event for subsequent fixtures.
+  await client.outboxEvent.update({ where: { id: event.id }, data: { deliveredAt: new Date() } });
+});
+
+test("a worker cannot publish DNS results after its lease expires without a replacement", async () => {
+  const { client, workspaceId, owner, fixture } = await setupProject();
+  const request = await requestVerification(client, actor(owner.id, workspaceId, "OWNER"), fixture.projectId);
+  const event = await claimOne(client);
+  await processVerificationJob(client, event, async () => {
+    await client.outboxEvent.update({ where: { id: event.id }, data: { claimUntil: new Date(0) } });
+    return [[request.recordValue]];
+  });
+  const verification = await client.domainVerification.findUniqueOrThrow({ where: { id: request.verificationId } });
+  assert.equal(verification.status, "RUNNING");
+  assert.equal(verification.verifiedAt, null);
+  const undelivered = await client.outboxEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(undelivered.deliveredAt, null);
+  const replacement = await claimOne(client);
+  await processVerificationJob(client, replacement, async () => [[request.recordValue]]);
 });
 
 test("only one active verification per project; rotated challenges fence stale jobs", async () => {

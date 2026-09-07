@@ -1,12 +1,13 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { Resolver } from "node:dns/promises";
+import { isIP } from "node:net";
 import type * as dns from "node:dns";
 import { Transform, Readable, PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { classifyIpAddress } from "./address-classification.ts";
-import { BodyTooLargeError } from "./safe-fetch.ts";
+import { BodyTooLargeError, SafeFetchError } from "./safe-fetch.ts";
 import type { DnsResolver, Transport, TransportRequest, TransportResponse } from "./safe-fetch.ts";
 
 /**
@@ -22,6 +23,7 @@ import type { DnsResolver, Transport, TransportRequest, TransportResponse } from
 
 export function createDnsResolver(resolver = new Resolver()): DnsResolver {
   return async (hostname) => {
+    if (isIP(hostname)) return [hostname];
     const [v4, v6] = await Promise.all([
       resolver.resolve4(hostname).catch(() => [] as string[]),
       resolver.resolve6(hostname).catch(() => [] as string[]),
@@ -36,18 +38,24 @@ type LookupCallback = (
   family?: number,
 ) => void;
 
-function validatedLookup(dnsResolve: DnsResolver): import("node:net").LookupFunction {
+export function validatedLookup(dnsResolve: DnsResolver): import("node:net").LookupFunction {
   return (hostname: string, options: dns.LookupOptions, callback: LookupCallback) => {
     void dnsResolve(hostname)
       .then((addresses) => {
-        const publicAddress = addresses.find((address) => classifyIpAddress(address) === "PUBLIC");
+        if (addresses.some((address) => classifyIpAddress(address) !== "PUBLIC")) {
+          callback(new SafeFetchError("SECURITY_BLOCKED", `non-public DNS address for ${hostname}`), "");
+          return;
+        }
+        const publicAddress = addresses[0];
         if (publicAddress === undefined) {
           const error = new Error(`no public address for ${hostname}`) as NodeJS.ErrnoException;
           error.code = "ENOTFOUND";
           callback(error, "");
           return;
         }
-        callback(null, publicAddress, publicAddress.includes(":") ? 6 : 4);
+        const family = isIP(publicAddress);
+        if (options.all) callback(null, [{ address: publicAddress, family }]);
+        else callback(null, publicAddress, family);
       })
       .catch((error: NodeJS.ErrnoException) => {
         callback(error, "");
@@ -123,12 +131,13 @@ export function createNodeTransport(
       const outgoing = sender(
         {
           protocol: url.protocol,
-          hostname: url.hostname,
+          hostname: url.hostname.replace(/^\[|\]$/g, ""),
           port: url.port === "" ? undefined : Number(url.port),
           path: `${url.pathname}${url.search}`,
           method: "GET",
           headers,
           lookup,
+          agent: false,
           // TLS SNI + certificate validation stay bound to the original hostname.
           ...(url.protocol === "https:" ? { servername: url.hostname, rejectUnauthorized: true } : {}),
         },
@@ -139,8 +148,8 @@ export function createNodeTransport(
             flatHeaders[key] = Array.isArray(value) ? value.join(", ") : (value ?? "");
           }
           if (status >= 300 && status < 400) {
-            // Redirect: do not follow; consume and discard any body, keep headers.
-            response.resume();
+            // Redirect bodies are irrelevant and may never end; close immediately.
+            response.destroy();
             resolve({ status, headers: flatHeaders, body: emptyBody() });
             return;
           }

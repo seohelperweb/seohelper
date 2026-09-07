@@ -54,6 +54,8 @@ function evaluateHttpError(observation: RuleObservation): RuleEvaluation {
 
 /** noindex on an expected-indexable page (per-path overrides arrive with policy config). */
 function evaluateNoindex(observation: RuleObservation): RuleEvaluation {
+  const state = validity(observation, "robots");
+  if (state !== "KNOWN") return { verdict: "UNKNOWN", evidence: { fieldValidity: state } };
   if (observation.fetchOutcome !== "HTTP_RESPONSE" || !observation.robots) {
     return { verdict: "UNKNOWN", evidence: { fetchOutcome: observation.fetchOutcome } };
   }
@@ -86,7 +88,7 @@ function evaluateCanonicalConflict(observation: RuleObservation): RuleEvaluation
   }
   const { raw, resolved } = observation.canonical;
   if (raw.length === 0) return { verdict: "ABSENT", evidence: { canonicalCount: 0 } };
-  if (resolved.length === 0) {
+  if (resolved.length < raw.length) {
     return { verdict: "PRESENT", evidence: { problem: "invalid", raw: raw.join(", ") } };
   }
   const distinct = new Set(resolved);

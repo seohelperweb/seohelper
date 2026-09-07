@@ -13,10 +13,11 @@ export interface RateLimitRule {
 const AUTH_LIMITS: Record<string, RateLimitRule> = {
   "sign-in/email": { windowMs: 15 * 60_000, max: 20 },
   "sign-up/email": { windowMs: 60 * 60_000, max: 20 },
-  "email-verification/send-verification-email": { windowMs: 60 * 60_000, max: 10 },
+  "send-verification-email": { windowMs: 60 * 60_000, max: 10 },
 };
 
 const buckets = new Map<string, number[]>();
+let lastCleanup = 0;
 
 /** Drop expired windows so the map cannot grow without bound. */
 export function cleanupBuckets(now: number = Date.now()): void {
@@ -29,6 +30,10 @@ export function cleanupBuckets(now: number = Date.now()): void {
 
 /** Returns true when the request is within budget (allowed). */
 export function checkAuthRateLimit(path: string, subject: string, now: number = Date.now()): boolean {
+  if (now - lastCleanup >= 60_000) {
+    cleanupBuckets(now);
+    lastCleanup = now;
+  }
   // path like "/api/auth/sign-in/email"
   const route = path.replace(/^\/api\/auth\//, "").replace(/\/$/, "");
   const rule = AUTH_LIMITS[route];

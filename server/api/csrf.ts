@@ -44,9 +44,9 @@ export function expectedOrigin(request: Request): string | null {
  */
 export function assertSameOrigin(request: Request): void {
   if (isSafeMethod(request.method)) return;
+  if (!request.headers.has("origin")) return;
   const origin = requestOrigin(request);
-  if (origin === null) return;
-  if (origin !== expectedOrigin(request)) {
+  if (origin === null || origin === "null" || origin !== expectedOrigin(request)) {
     throw ApiError.forbidden("Cross-origin request rejected");
   }
 }

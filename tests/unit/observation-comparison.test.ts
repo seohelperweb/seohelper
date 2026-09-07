@@ -104,6 +104,26 @@ test("unknown verdicts on either side suppress content events", () => {
   assert.equal(compareObservations(base, current, true).length, 0);
 });
 
+test("canonical comparison treats resolved candidates as a set", () => {
+  const base = [
+    observation("a", {
+      canonical: { raw: ["/a", "/b"], resolved: ["https://example.com/a", "https://example.com/b"] },
+    }),
+  ];
+  const current = [
+    observation("a", {
+      canonical: {
+        raw: ["/b", "/a", "/a"],
+        resolved: ["https://example.com/b", "https://example.com/a", "https://example.com/a"],
+      },
+    }),
+  ];
+  assert.deepEqual(compareObservations(base, current, true), []);
+  const changed = compareObservations(base, [observation("a")], true);
+  assert.equal(changed.length, 1);
+  assert.equal(changed[0].type, "CANONICAL_CHANGED");
+});
+
 test("summary separates event counts from affected pages", () => {
   const base = [observation("a"), observation("b")];
   const current = [

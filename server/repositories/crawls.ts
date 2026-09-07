@@ -37,17 +37,15 @@ export async function createRun(
 
 /** Atomically take over the run lease; stale lease holders can no longer write (docs §7.1). */
 export async function acquireLease(db: DbClient, runId: string, leaseMs: number, now: Date): Promise<number | null> {
-  const result = await db.crawlRun.updateMany({
-    where: {
-      id: runId,
-      status: { in: [...ACTIVE_RUN_STATUSES] },
-      OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
-    },
-    data: { status: "RUNNING", leaseToken: { increment: 1 }, leaseExpiresAt: new Date(now.getTime() + leaseMs) },
-  });
-  if (result.count !== 1) return null;
-  const run = await db.crawlRun.findUniqueOrThrow({ where: { id: runId }, select: { leaseToken: true } });
-  return run.leaseToken;
+  const rows = await db.$queryRaw<Array<{ leaseToken: number }>>`
+    UPDATE "CrawlRun"
+    SET "status" = CASE WHEN "status" = 'FINALIZING' THEN 'FINALIZING'::"CrawlRunStatus" ELSE 'RUNNING'::"CrawlRunStatus" END,
+        "leaseToken" = "leaseToken" + 1, "leaseExpiresAt" = ${new Date(now.getTime() + leaseMs)}, "updatedAt" = ${now}
+    WHERE "id" = ${runId} AND "status" IN ('QUEUED', 'RUNNING', 'FINALIZING')
+      AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= ${now})
+    RETURNING "leaseToken"
+  `;
+  return rows[0]?.leaseToken ?? null;
 }
 
 /** Fenced write: only the current lease holder may mutate run state. */
@@ -56,10 +54,19 @@ export async function withRunFence<T>(
   runId: string,
   leaseToken: number,
   fn: (tx: DbClient) => Promise<T>,
+  projectId?: string,
 ): Promise<T | null> {
   return db.$transaction(async (tx) => {
-    const run = await tx.crawlRun.findUnique({ where: { id: runId }, select: { leaseToken: true, status: true } });
-    if (!run || run.leaseToken !== leaseToken) return null;
+    if (projectId !== undefined) {
+      await tx.$queryRaw`SELECT "id" FROM "Project" WHERE "id" = ${projectId} FOR UPDATE`;
+    }
+    const rows = await tx.$queryRaw<Array<{ leaseToken: number; status: string }>>`
+      SELECT "leaseToken", "status" FROM "CrawlRun" WHERE "id" = ${runId} FOR UPDATE
+    `;
+    const run = rows[0];
+    if (!run || run.leaseToken !== leaseToken || !ACTIVE_RUN_STATUSES.some((status) => status === run.status)) {
+      return null;
+    }
     return fn(tx);
   });
 }
@@ -72,7 +79,7 @@ export async function renewLease(
   now: Date,
 ): Promise<boolean> {
   const result = await db.crawlRun.updateMany({
-    where: { id: runId, leaseToken },
+    where: { id: runId, leaseToken, status: { in: [...ACTIVE_RUN_STATUSES] } },
     data: { leaseExpiresAt: new Date(now.getTime() + leaseMs) },
   });
   return result.count === 1;
@@ -98,8 +105,13 @@ export async function countFrontier(db: DbClient, runId: string): Promise<number
   return db.crawlFrontier.count({ where: { runId } });
 }
 
-export async function claimNextFrontierItem(db: PrismaClient, runId: string, now: Date): Promise<CrawlFrontier | null> {
-  return db.$transaction(async (tx) => {
+export async function claimNextFrontierItem(
+  db: PrismaClient,
+  runId: string,
+  now: Date,
+  leaseToken?: number,
+): Promise<CrawlFrontier | null> {
+  const claim = async (tx: DbClient) => {
     const next = await tx.crawlFrontier.findFirst({
       where: { runId, state: "PENDING", nextAttemptAt: { lte: now } },
       orderBy: [{ depth: "asc" }, { urlKey: "asc" }],
@@ -110,19 +122,29 @@ export async function claimNextFrontierItem(db: PrismaClient, runId: string, now
       data: { state: "FETCHING" },
     });
     return updated.count === 1 ? next : null;
-  });
+  };
+  return leaseToken === undefined ? db.$transaction(claim) : withRunFence(db, runId, leaseToken, claim);
 }
 
-export async function resetStaleFrontier(db: PrismaClient, runId: string, now: Date): Promise<number> {
-  const result = await db.crawlFrontier.updateMany({
-    where: { runId, state: "FETCHING" },
-    data: { state: "PENDING", nextAttemptAt: now },
-  });
-  return result.count;
+export async function resetStaleFrontier(
+  db: PrismaClient,
+  runId: string,
+  now: Date,
+  leaseToken?: number,
+): Promise<number> {
+  const reset = async (tx: DbClient) => {
+    const result = await tx.crawlFrontier.updateMany({
+      where: { runId, state: "FETCHING" },
+      data: { state: "PENDING", nextAttemptAt: now },
+    });
+    return result.count;
+  };
+  return leaseToken === undefined ? reset(db) : ((await withRunFence(db, runId, leaseToken, reset)) ?? 0);
 }
 
 export interface UpsertObservationInput {
   runId: string;
+  leaseToken?: number;
   projectId: string;
   identityVersion: number;
   identityUrl: string;
@@ -155,7 +177,11 @@ export interface UpsertObservationInput {
 /** Upsert the page identity and write the (idempotent) observation for this run. */
 export async function saveObservation(db: PrismaClient, input: UpsertObservationInput): Promise<{ created: boolean }> {
   const urlKey = urlKeyOf(input.identityUrl);
-  return db.$transaction(async (tx) => {
+  const save = async (tx: DbClient) => {
+    if (input.leaseToken !== undefined) {
+      const run = await tx.crawlRun.findUniqueOrThrow({ where: { id: input.runId }, select: { status: true } });
+      if (run.status !== "RUNNING") return { created: false };
+    }
     const page = await tx.page.upsert({
       where: {
         projectId_identityVersion_urlKey: {
@@ -202,7 +228,10 @@ export async function saveObservation(db: PrismaClient, input: UpsertObservation
     await tx.page.update({ where: { id: page.id }, data: { lastSeenRunId: input.runId } });
     await tx.crawlRun.update({ where: { id: input.runId }, data: { pagesDone: { increment: 1 } } });
     return { created: true };
-  });
+  };
+  return input.leaseToken === undefined
+    ? db.$transaction(save)
+    : ((await withRunFence(db, input.runId, input.leaseToken, save)) ?? { created: false });
 }
 
 export async function countObservations(db: DbClient, runId: string): Promise<number> {

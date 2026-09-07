@@ -14,13 +14,20 @@ export default function LoginPage() {
     event.preventDefault();
     setError(null);
     setPending(true);
-    const { error } = await authClient.signIn.email({ email, password });
-    setPending(false);
-    if (error) {
-      setError(error.message ?? "登录失败，请重试");
-      return;
+    try {
+      const { error } = await authClient.signIn.email({ email, password });
+      if (error) {
+        setError(error.message ?? "登录失败，请重试");
+        return;
+      }
+      const next = new URLSearchParams(window.location.search).get("next");
+      const target = new URL(next ?? "/", window.location.origin);
+      window.location.href = target.origin === window.location.origin ? target.href : "/";
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "登录失败，请重试");
+    } finally {
+      setPending(false);
     }
-    window.location.href = "/";
   };
 
   return (

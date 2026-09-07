@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { getDb } from "@seo/db";
 import { handleApi } from "@/server/api/handle.ts";
+import { readJson } from "@/server/api/read-json.ts";
 import { pageParams } from "@/server/api/page-params.ts";
 import { projectDto } from "@/server/api/project-dto.ts";
 import { requireActor } from "@/server/auth/actor.ts";
@@ -31,7 +32,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   const { workspaceId } = await params;
   return handleApi(request, async (requestId) => {
     const actor = await requireActor(request, workspaceId);
-    const input = createBody.parse(await request.json());
+    const input = createBody.parse(await readJson(request));
     const project = await createProject(getDb(), actor, input, requestId);
     return projectDto(
       {
