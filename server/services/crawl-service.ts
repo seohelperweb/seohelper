@@ -133,7 +133,7 @@ export async function getCrawl(
   crawlId: string,
 ): Promise<CrawlDetail> {
   if (!can(actor.role, "view")) throw ApiError.forbidden();
-  const run = await findRunScoped(db, projectId, crawlId);
+  const run = await findRunScoped(db, actor.workspaceId, projectId, crawlId);
   if (!run) throw ApiError.notFound("Crawl not found");
   return run;
 }
@@ -190,7 +190,7 @@ export async function cancelCrawl(
   requestId?: string,
 ): Promise<CancelCrawlResult> {
   if (!can(actor.role, "run-crawl")) throw ApiError.forbidden();
-  const run = await findRunScoped(db, projectId, crawlId);
+  const run = await findRunScoped(db, actor.workspaceId, projectId, crawlId);
   if (!run) throw ApiError.notFound("Crawl not found");
 
   if (run.status === "CANCELLED") {

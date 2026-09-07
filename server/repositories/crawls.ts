@@ -7,8 +7,14 @@ export function urlKeyOf(identityUrl: string): string {
   return createHash("sha256").update(identityUrl, "utf8").digest("hex");
 }
 
-export async function findRunScoped(db: DbClient, projectId: string, runId: string): Promise<CrawlRun | null> {
-  return db.crawlRun.findFirst({ where: { id: runId, projectId } });
+/** Tenancy guard: the run's project must belong to the workspace, else null (→ 404). */
+export async function findRunScoped(
+  db: DbClient,
+  workspaceId: string,
+  projectId: string,
+  runId: string,
+): Promise<CrawlRun | null> {
+  return db.crawlRun.findFirst({ where: { id: runId, projectId, project: { workspaceId } } });
 }
 
 export async function hasActiveRun(db: DbClient, projectId: string): Promise<boolean> {

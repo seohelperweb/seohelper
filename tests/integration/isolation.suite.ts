@@ -5,6 +5,8 @@ import { actor, cleanDatabase, createWorkspaceWithOwner, createUser, db, uniqueI
 import { loadActor } from "../../server/auth/actor.ts";
 import { ApiError } from "../../server/api/errors.ts";
 import { createProject, getProject, listProjects } from "../../server/services/project-service.ts";
+import { cancelCrawl, getCrawl } from "../../server/services/crawl-service.ts";
+import { createRun } from "../../server/repositories/crawls.ts";
 import { listMembers } from "../../server/services/member-service.ts";
 import { listForWorkspace as listAuditLogs } from "../../server/repositories/audit.ts";
 import { withIdempotency } from "../../server/repositories/idempotency.ts";
@@ -62,6 +64,50 @@ test("project reads and lists stay workspace-scoped", async () => {
   // Only Bob's own workspace-created entry; nothing from Alice's workspace leaks.
   assert.equal(bobAudit.items.length, 1);
   assert.ok(bobAudit.items.every((entry) => entry.workspaceId === wsBob));
+});
+
+test("crawl reads and cancels stay workspace-scoped", async () => {
+  const client = db();
+  const alice = await createUser(client);
+  const bob = await createUser(client);
+  const wsAlice = await createWorkspaceWithOwner(client, alice, "Alpha");
+  const wsBob = await createWorkspaceWithOwner(client, bob, "Beta");
+
+  const hostname = `crawl-site-${uniqueId()}.example.com`;
+  const project = await createProject(client, actor(alice.id, wsAlice, "OWNER"), { hostname });
+  const policyId = project.currentPolicyId;
+  assert.ok(policyId);
+  const run = await createRun(client, {
+    projectId: project.id,
+    policyId,
+    trigger: "MANUAL",
+    baseRunId: null,
+    pagesKnown: 0,
+  });
+
+  const detail = await getCrawl(client, actor(alice.id, wsAlice, "OWNER"), project.id, run.id);
+  assert.equal(detail.id, run.id);
+
+  // Even a fabricated OWNER actor from another workspace gets 404 on read and cancel.
+  await assert.rejects(getCrawl(client, actor(bob.id, wsBob, "OWNER"), project.id, run.id), (error: unknown) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 404);
+    return true;
+  });
+  await assert.rejects(cancelCrawl(client, actor(bob.id, wsBob, "OWNER"), project.id, run.id), (error: unknown) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 404);
+    return true;
+  });
+
+  // The rejected attempts did not mutate the run.
+  const untouched = await client.crawlRun.findUniqueOrThrow({ where: { id: run.id } });
+  assert.equal(untouched.status, "QUEUED");
+  assert.equal(untouched.cancelRequestedAt, null);
+
+  // The legitimate workspace can still cancel it.
+  const cancelled = await cancelCrawl(client, actor(alice.id, wsAlice, "OWNER"), project.id, run.id);
+  assert.equal(cancelled.status, "CANCELLED");
 });
 
 test("idempotency replays identical requests and rejects hash mismatches", async () => {
