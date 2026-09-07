@@ -2,14 +2,18 @@
 
 A focused MVP for monitoring meaningful technical SEO changes between website crawls.
 
+> 中文版：[README.zh-CN.md](./README.zh-CN.md)
+
 ## Architecture and implementation plan
 
-- [整体架构设计](docs/ARCHITECTURE.md): team workspaces, system boundaries, crawl safety, data model, APIs, and report semantics.
-- [分阶段实施计划](docs/IMPLEMENTATION_PLAN.md): delivery sequence, dependencies, and acceptance tests.
+- [整体架构设计](docs/ARCHITECTURE.md): team workspaces, system boundaries, crawl safety, data model, APIs, and report semantics (English: [ARCHITECTURE.en.md](docs/ARCHITECTURE.en.md)).
+- [分阶段实施计划](docs/IMPLEMENTATION_PLAN.md): delivery sequence, dependencies, and acceptance tests (English: [IMPLEMENTATION_PLAN.en.md](docs/IMPLEMENTATION_PLAN.en.md)).
 - [本地开发指南](docs/LOCAL_DEV.md): toolchain, scripts, local database, and current implementation status.
 - [部署与运维手册](docs/OPERATIONS.md): topology, configuration, health probes, backups, retention, quotas.
 
 Progress: **P0–P4 are complete** — the first-version feature set is closed (identity, workspaces, verified projects, safe crawling, the report loop, weekly scheduling, quotas, retention cleanup, health probes, and deployment assets). The first P5 enhancement — the **site health score v1** — is also implemented (formula, coverage gate, and versioning per [ARCHITECTURE.md §9](docs/ARCHITECTURE.md)). Remaining P5 items (email digests, webhooks, link graph, rendered crawling) are intentionally out of the first version.
+
+A second hardening round (2026-09-07) closed the security and UX gaps found in review — see [Hardening pass](#hardening-pass-2026-09-07).
 
 ## Repository layout
 
@@ -63,6 +67,56 @@ Packages are npm workspaces exporting TypeScript source directly. Pure rules imp
 
 The production fetch worker (P2) must still resolve DNS and re-run the SSRF check against every resolved address, including after each redirect.
 
+## Deployment
+
+### Production (Docker Compose)
+
+Reference topology in [`docker-compose.prod.yml`](docker-compose.prod.yml): one image serves both the web app and the worker; PostgreSQL 17 runs with a persistent volume.
+
+1. Create `.env` (template: [.env.example](.env.example)) and set the production values:
+   - `POSTGRES_PASSWORD` — database password
+   - `APP_ORIGIN` — the public site URL, e.g. `https://indexly.example.com` (drives auth and CSRF origin checks; must match what browsers actually use)
+   - `AUTH_SECRET` — random secret, at least 32 characters
+   - `CRAWLER_USER_AGENT` — optional; defaults to `IndexlyBot/0.1`, set one with a contact URL
+2. Start the database first and apply schema migrations (required before the app):
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d postgres
+   docker compose -f docker-compose.prod.yml run --rm web \
+     npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
+   ```
+3. Start web and worker:
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d
+   ```
+4. Verify: `GET /api/healthz` (liveness) and `GET /api/readyz` (database readiness, returns 503 when the DB is unreachable). Terminate TLS in front of `web:3000`; `APP_ORIGIN` must match the public URL.
+
+Web and worker share the same image; the worker runs `node server/workers/main.ts` and owns crawling, verification, scheduling, and retention cleanup. For production, prefer a managed PostgreSQL, pin exact image tags per release, and scale the worker independently. Backups, retention, quotas, and monitoring: [OPERATIONS.md](docs/OPERATIONS.md).
+
+### Bare metal (Node.js)
+
+Requires Node.js 24+ and PostgreSQL 17:
+
+```bash
+npm ci
+npm run build
+DATABASE_URL=... AUTH_SECRET=... APP_ORIGIN=... npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
+DATABASE_URL=... AUTH_SECRET=... APP_ORIGIN=... npm start      # web (port 3000)
+DATABASE_URL=... AUTH_SECRET=... APP_ORIGIN=... npm run worker # worker (separate process)
+```
+
+### Environment variables
+
+| Variable             | Required in prod | Description                                                  |
+| -------------------- | ---------------- | ------------------------------------------------------------ |
+| `DATABASE_URL`       | yes              | PostgreSQL connection string                                 |
+| `AUTH_SECRET`        | yes              | session secret, ≥32 chars; rotation invalidates all sessions |
+| `APP_ORIGIN`         | yes              | public site URL (auth base URL + origin checks)              |
+| `CRAWLER_USER_AGENT` | yes              | crawler user agent, include a contact URL                    |
+| `APP_ENV`            | no               | `production` / `test` / `development`                        |
+| `LOG_LEVEL`          | no               | `debug` / `info` / `warn` / `error`                          |
+
+All variables are validated at startup by `parseEnv` (`packages/contracts`); missing production values abort startup.
+
 ## Run locally
 
 Requires Node.js 24+.
@@ -80,8 +134,8 @@ All quality gates (also run by CI on every push and pull request):
 ```bash
 npm run typecheck          # tsc --noEmit across app, packages, and tests
 npm run lint               # ESLint
-npm test                   # unit tests (no database needed)
-npm run test:integration   # migrations + PostgreSQL integration tests
+npm test                   # unit tests (no database needed; currently 90 tests)
+npm run test:integration   # migrations + PostgreSQL integration tests (currently 40 tests)
 npm run build              # Next.js production build
 npm run format             # Prettier
 ```
@@ -94,3 +148,11 @@ Copy `.env.example` to `.env` for the dev server; `parseEnv` in `packages/contra
 - **Protocol fallback**: robots probing tries HTTPS first and falls back to HTTP:80 only on network-level failure or an HTTPS 404/410 (plain-HTTP-only sites); an HTTP answer is never re-asked over HTTPS, and authoritative 401/403 refusals never fall back.
 - **CSRF & brute-force defence**: `/api/v1` state-changing requests are Origin-checked (cross-site browser requests rejected); `/api/auth` sign-in/sign-up/verification endpoints are rate-limited per IP with a sliding window (in-memory; a shared store is required for multi-process auth).
 - **Member management UI**: workspace members/invitations panel with role changes, removal (last-owner protected server-side), one-time invitations with single-display shareable link, and revocation of pending invites.
+
+### Second hardening pass (2026-09-07)
+
+- **Permission isolation**: crawl detail and cancel are workspace-scoped (outsiders get 404); issue suppression rejects cross-workspace requests; the role matrix is enforced even on no-op requests; last-owner protection holds under concurrent demotions.
+- **Idempotency**: recording the idempotency key and the business mutation are one atomic transaction — a failure to record rolls the mutation back.
+- **Verification races**: a DNS result cannot overwrite verification state after another worker takes the claim; workers cannot publish after lease expiry without a replacement.
+- **Report rules**: publication refuses cancelled runs, cancellation requests, and unfinished crawls; repeated publication is idempotent; current issue reads exclude prior policy scopes and rule versions; cursor pagination visits every change and issue exactly once.
+- **Frontend**: switching workspace/project invalidates in-flight requests so stale responses can't overwrite new data; DNS verification status auto-refreshes while a challenge is active; "resend verification email" calls the correct endpoint via the auth client; login honors a same-origin `next` redirect; clipboard failures surface a fallback hint; malformed JSON request bodies return 400 instead of 500.
