@@ -1,0 +1,55 @@
+{
+  "name": "seo-change-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "node --test tests/unit/*.test.ts",
+    "test:integration": "prisma migrate deploy --schema packages/db/prisma/schema.prisma && node --env-file-if-exists=.env --test tests/integration/index.test.ts",
+    "worker": "node --env-file-if-exists=.env server/workers/main.ts",
+    "db:up": "node scripts/embedded-postgres-server.ts",
+    "db:generate": "prisma generate --schema packages/db/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma",
+    "db:deploy": "prisma migrate deploy --schema packages/db/prisma/schema.prisma",
+    "db:studio": "prisma studio --schema packages/db/prisma/schema.prisma",
+    "postinstall": "prisma generate --schema packages/db/prisma/schema.prisma"
+  },
+  "dependencies": {
+    "better-auth": "^1.7.3",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.3.7",
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "embedded-postgres": "17.10.0-beta.17",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.1.0",
+    "eslint-config-prettier": "^10.0.0",
+    "pg": "^8.23.0",
+    "prettier": "^3.0.0",
+    "prisma": "^6.19.3",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}

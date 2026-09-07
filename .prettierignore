@@ -1,0 +1,8 @@
+node_modules
+.next
+out
+package-lock.json
+next-env.d.ts
+app/globals.css
+docs
+.mimosa

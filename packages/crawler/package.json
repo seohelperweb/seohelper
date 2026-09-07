@@ -1,0 +1,16 @@
+{
+  "name": "@seo/crawler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@seo/contracts": "^0.1.0",
+    "cheerio": "^1.2.0"
+  }
+}

@@ -1,0 +1,523 @@
+// Indexly data model — P1 identity and workspace foundation.
+// See docs/ARCHITECTURE.md §5. Crawl/page/issue tables arrive with P2/P3.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Better Auth managed identity tables (docs/ARCHITECTURE.md §2, §4)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  memberships   Membership[]
+  sessions      Session[]
+  accounts      Account[]
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([providerId, accountId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces, membership, invitations
+// ---------------------------------------------------------------------------
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model Workspace {
+  id          String       @id @default(cuid())
+  name        String
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  memberships Membership[]
+  invitations Invitation[]
+  projects    Project[]
+}
+
+model Membership {
+  id          String        @id @default(cuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        WorkspaceRole @default(VIEWER)
+  createdAt   DateTime      @default(now())
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model Invitation {
+  id               String     @id @default(cuid())
+  workspaceId      String
+  workspace        Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email            String
+  role             WorkspaceRole
+  tokenHash        String     @unique
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  consumedByUserId String?
+  revokedAt        DateTime?
+  createdAt        DateTime   @default(now())
+
+  @@index([workspaceId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Projects, policies, domain verification
+// ---------------------------------------------------------------------------
+
+enum ProjectVerificationStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+}
+
+model Project {
+  id                  String                    @id @default(cuid())
+  workspaceId         String
+  workspace           Workspace                 @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  hostname            String
+  displayName         String?
+  verificationStatus  ProjectVerificationStatus @default(PENDING_VERIFICATION)
+  currentPolicy       ProjectPolicy?            @relation("CurrentPolicy", fields: [currentPolicyId], references: [id])
+  currentPolicyId     String?                   @unique
+  archivedAt          DateTime?
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+  policies            ProjectPolicy[]           @relation("ProjectPolicies")
+  verifications       DomainVerification[]
+  runs                CrawlRun[]
+  pages               Page[]
+  issues              Issue[]
+  schedule            CrawlSchedule?
+  occurrences         ScheduleOccurrence[]
+  latestPublishedRun  CrawlRun?                 @relation("LatestPublishedRun", fields: [latestPublishedRunId], references: [id])
+  latestPublishedRunId String?                  @unique
+
+  @@unique([workspaceId, hostname])
+  @@index([workspaceId, createdAt])
+}
+
+model ProjectPolicy {
+  id               String   @id @default(cuid())
+  projectId        String
+  project          Project  @relation("ProjectPolicies", fields: [projectId], references: [id], onDelete: Cascade)
+  version          Int
+  scopeGeneration  Int      @default(1)
+  config           Json
+  identityVersion  Int      @default(1)
+  extractorVersion Int      @default(1)
+  ruleVersion      Int      @default(1)
+  policyHash       String
+  createdAt        DateTime @default(now())
+
+  currentFor       Project? @relation("CurrentPolicy")
+
+  @@unique([projectId, version])
+}
+
+enum VerificationJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model DomainVerification {
+  id                  String               @id @default(cuid())
+  projectId           String
+  project             Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  challengeValue      String
+  challengeValueHash  String
+  challengeVersion    Int
+  status              VerificationJobStatus @default(PENDING)
+  checkedAt           DateTime?
+  lastError           String?
+  attempts            Int                   @default(0)
+  verifiedAt          DateTime?
+  expiresAt           DateTime?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@index([projectId, challengeVersion])
+}
+
+// ---------------------------------------------------------------------------
+// Outbox, idempotency, audit
+// ---------------------------------------------------------------------------
+
+model OutboxEvent {
+  id             String    @id @default(cuid())
+  eventId        String    @unique
+  type           String
+  aggregateId    String
+  payloadVersion Int       @default(1)
+  payload        Json
+  availableAt    DateTime  @default(now())
+  claimToken     String?
+  claimUntil     DateTime?
+  attempts       Int       @default(0)
+  deliveredAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([type, availableAt, deliveredAt])
+}
+
+model IdempotencyRecord {
+  id          String   @id @default(cuid())
+  actorId     String
+  workspaceId String
+  route       String
+  key         String
+  requestHash String
+  resourceId  String
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@unique([actorId, workspaceId, route, key])
+}
+
+model AuditLog {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  actorId         String
+  action          String
+  resourceId      String?
+  requestId       String?
+  redactedDetails Json?
+  createdAt       DateTime @default(now())
+
+  @@index([workspaceId, createdAt, id])
+}
+
+// ---------------------------------------------------------------------------
+// Crawls (P2): runs, frontier, pages, observations
+// ---------------------------------------------------------------------------
+
+enum CrawlRunStatus {
+  QUEUED
+  RUNNING
+  FINALIZING
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum CrawlTrigger {
+  MANUAL
+  SCHEDULED
+}
+
+enum CrawlCompleteness {
+  NONE
+  FULL
+  PARTIAL
+}
+
+enum ComparisonMode {
+  NONE
+  BASELINE
+  DIFF
+}
+
+enum CrawlFetchOutcome {
+  HTTP_RESPONSE
+  REDIRECT_BLOCKED
+  SECURITY_BLOCKED
+  SCOPE_BLOCKED
+  ROBOTS_BLOCKED
+  NETWORK_ERROR
+  BODY_TOO_LARGE
+  TIMEOUT
+  REDIRECT_LIMIT
+}
+
+model CrawlRun {
+  id                String            @id @default(cuid())
+  projectId         String
+  project           Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  policyId          String
+  trigger           CrawlTrigger      @default(MANUAL)
+  status            CrawlRunStatus    @default(QUEUED)
+  completeness      CrawlCompleteness @default(NONE)
+  comparisonMode    ComparisonMode    @default(NONE)
+  baseRunId         String?
+  failureCode       String?
+  pagesDone         Int               @default(0)
+  pagesKnown        Int               @default(0)
+  bytesDownloaded   Int               @default(0)
+  leaseToken        Int               @default(0)
+  leaseExpiresAt    DateTime?
+  cancelRequestedAt DateTime?
+  finishedAt        DateTime?
+  publishedAt       DateTime?
+  detailsExpiredAt  DateTime?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  frontier          CrawlFrontier[]
+  observations      PageObservation[]
+  changeEvents      ChangeEvent[]
+  summary           CrawlSummary?
+  projectOfLatest   Project?         @relation("LatestPublishedRun")
+
+  @@index([projectId, createdAt])
+}
+
+enum FrontierState {
+  PENDING
+  FETCHING
+  DONE
+  SKIPPED
+}
+
+enum FrontierSource {
+  SEED
+  SITEMAP
+  LINK
+  REDIRECT
+  MONITORED
+}
+
+model CrawlFrontier {
+  id            String         @id @default(cuid())
+  runId         String
+  run           CrawlRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  urlKey        String
+  requestUrl    String
+  depth         Int            @default(0)
+  source        FrontierSource @default(SEED)
+  state         FrontierState  @default(PENDING)
+  attempts      Int            @default(0)
+  nextAttemptAt DateTime       @default(now())
+  skipReason    String?
+  createdAt     DateTime       @default(now())
+
+  @@unique([runId, urlKey])
+  @@index([runId, state, nextAttemptAt, depth])
+}
+
+model Page {
+  id              String           @id @default(cuid())
+  projectId       String
+  project         Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  identityVersion Int
+  urlKey          String
+  identityUrl     String
+  firstSeenRunId  String?
+  lastSeenRunId   String?
+  createdAt       DateTime         @default(now())
+  observations    PageObservation[]
+  changeEvents    ChangeEvent[]
+  issues          Issue[]
+
+  @@unique([projectId, identityVersion, urlKey])
+  @@index([projectId, lastSeenRunId])
+}
+
+model PageObservation {
+  id                 String             @id @default(cuid())
+  runId              String
+  run                CrawlRun           @relation(fields: [runId], references: [id], onDelete: Cascade)
+  pageId             String
+  page               Page               @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  fetchOutcome       CrawlFetchOutcome
+  requestUrl         String
+  finalUrl           String?
+  initialStatus      Int?
+  finalStatus        Int?
+  redirectChain      Json?
+  contentType        String?
+  title              String?
+  metaDescription    String?
+  canonical          Json?
+  robots             Json?
+  internalLinksCount Int?
+  fieldValidity      Json?
+  failureCode        String?
+  fetchedAt          DateTime           @default(now())
+
+  @@unique([runId, pageId])
+  @@index([runId, fetchOutcome])
+}
+
+// ---------------------------------------------------------------------------
+// Reports (P3): change events, issues, summary
+// ---------------------------------------------------------------------------
+
+enum ChangeSeverity {
+  CRITICAL
+  WARNING
+  INFO
+}
+
+enum IssueState {
+  OPEN
+  RESOLVED
+}
+
+model ChangeEvent {
+  id          String         @id @default(cuid())
+  runId       String
+  run         CrawlRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  baseRunId   String?
+  pageId      String
+  page        Page           @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  type        String
+  before      Json?
+  after       Json?
+  severity    ChangeSeverity
+  ruleVersion Int
+  createdAt   DateTime       @default(now())
+
+  @@unique([runId, pageId, type])
+  @@index([runId, severity, type, id])
+}
+
+model Issue {
+  id                 String           @id @default(cuid())
+  projectId          String
+  project            Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  pageId             String
+  page               Page             @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  scopeGeneration    Int
+  ruleKey            String
+  ruleVersion        Int
+  state              IssueState       @default(OPEN)
+  occurrence         Int              @default(1)
+  suppressedUntil    DateTime?
+  lastEvaluatedRunId String?
+  lastConfirmedRunId String?
+  lastConfirmedAt    DateTime?
+  evidence           Json?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  transitions        IssueTransition[]
+
+  @@unique([projectId, pageId, scopeGeneration, ruleKey, ruleVersion])
+  @@index([projectId, state, ruleKey])
+}
+
+model IssueTransition {
+  id            String   @id @default(cuid())
+  issueId       String
+  issue         Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  runId         String
+  fromState     String?
+  toState       String
+  occurrence    Int
+  idempotencyKey String @unique
+  createdAt     DateTime @default(now())
+}
+
+// Site health score (P5, docs/ARCHITECTURE.md §9): stored per published run
+// with its score version, coverage ratio, gate reason and per-component
+// breakdown; all nullable because runs without sufficient coverage or runs
+// published before P5 carry no score.
+model CrawlSummary {
+  runId                 String         @id
+  run                   CrawlRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  schemaVersion         Int            @default(1)
+  comparisonMode        ComparisonMode
+  urlsCrawled           Int
+  changesTotal          Int
+  changesCritical       Int
+  changesWarning        Int
+  changesInfo           Int
+  affectedPages         Int
+  issuesOpen            Int
+  issuesResolvedThisRun Int
+  healthScore           Int?
+  healthScoreVersion    Int?
+  healthCoverage        Float?
+  healthReason          String?
+  healthComponents      Json?
+  createdAt             DateTime       @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Weekly scheduling (P4, docs/ARCHITECTURE.md §12)
+// ---------------------------------------------------------------------------
+
+model CrawlSchedule {
+  id              String              @id @default(cuid())
+  projectId       String              @unique
+  project         Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  enabled         Boolean             @default(false)
+  intervalDays    Int                 @default(7)
+  nextRunAt       DateTime
+  displayTimezone String              @default("UTC")
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  occurrences     ScheduleOccurrence[]
+}
+
+model ScheduleOccurrence {
+  id           String        @id @default(cuid())
+  projectId    String
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  schedule     CrawlSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  scheduleId   String
+  scheduledFor DateTime
+  status       String // TRIGGERED | SKIPPED_BUSY | SKIPPED_UNVERIFIED | SKIPPED_ARCHIVED | SKIPPED_MISSED
+  runId        String?
+  reason       String?
+  createdAt    DateTime      @default(now())
+
+  @@unique([projectId, scheduledFor])
+  @@index([projectId, scheduledFor])
+}

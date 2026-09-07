@@ -1,0 +1,60 @@
+# Single-host reference topology. Production should use a managed PostgreSQL
+# and scale the worker independently. Pin the image tag per release.
+services:
+  postgres:
+    image: postgres:17-alpine # pin an exact patch version per release
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: indexly
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: indexly
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indexly"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://indexly:${POSTGRES_PASSWORD}@postgres:5432/indexly
+      APP_ENV: production
+      APP_ORIGIN: ${APP_ORIGIN:?set APP_ORIGIN}
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET}
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-IndexlyBot/0.1}
+      LOG_LEVEL: info
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["node", "server/workers/main.ts"]
+    environment:
+      DATABASE_URL: postgresql://indexly:${POSTGRES_PASSWORD}@postgres:5432/indexly
+      APP_ENV: production
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET}
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
